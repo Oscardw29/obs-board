@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getBoardForObs } from "@/lib/store";
+import { computeElementsHash, getBoardForObs } from "@/lib/store";
 
 export async function GET(
   req: Request,
@@ -8,6 +8,7 @@ export async function GET(
   const { id } = await ctx.params;
   const url = new URL(req.url);
   const token = url.searchParams.get("token") ?? "";
+  const clientHash = url.searchParams.get("hash");
   const board = await getBoardForObs(id, token);
 
   if (!board) {
@@ -17,8 +18,16 @@ export async function GET(
     );
   }
 
+  const serverHash = computeElementsHash(board.elements);
+  if (clientHash && clientHash === serverHash) {
+    return NextResponse.json(
+      { unchanged: true, hash: serverHash },
+      { headers: { "Cache-Control": "no-store, max-age=0" } }
+    );
+  }
+
   return NextResponse.json(
-    { board },
+    { board, hash: serverHash },
     {
       headers: {
         "Cache-Control": "no-store, max-age=0",

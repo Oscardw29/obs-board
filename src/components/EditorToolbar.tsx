@@ -1,14 +1,19 @@
 "use client";
 
-import React from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ArrowUpRight,
+  Check,
+  ChevronDown,
   Circle,
-  Hand,
+  Eraser,
+  FileText,
+  Grid3x3,
+  Magnet,
   Maximize2,
   Minus,
   MousePointer2,
-  Pencil,
+  Paintbrush,
   Redo2,
   Square,
   Type,
@@ -19,6 +24,13 @@ import {
 import type { ToolType } from "@/types/board";
 
 export type EditorBackdrop = "checker-dark" | "checker-light" | "black" | "chroma";
+
+export interface BoardGuidesConfig {
+  enabled: boolean;
+  showCenterAxes: boolean;
+  showRuleOfThirds: boolean;
+  showSafeZones: boolean;
+}
 
 interface EditorToolbarProps {
   tool: ToolType;
@@ -34,6 +46,11 @@ interface EditorToolbarProps {
   onFitStage: () => void;
   backdrop: EditorBackdrop;
   onBackdropChange: (next: EditorBackdrop) => void;
+  snapEnabled: boolean;
+  onToggleSnap: () => void;
+  guidesConfig: BoardGuidesConfig;
+  onGuidesConfigChange: (next: BoardGuidesConfig) => void;
+  onOpenDocumentModal: () => void;
 }
 
 const TOOLS: Array<{
@@ -43,14 +60,61 @@ const TOOLS: Array<{
   icon: React.ComponentType<{ className?: string }>;
   editOnly?: boolean;
 }> = [
-  { id: "select", label: "Seleccionar", shortcut: "V", icon: MousePointer2 },
-  { id: "hand", label: "Mover lienzo", shortcut: "H", icon: Hand },
-  { id: "freehand", label: "Lápiz libre", shortcut: "P", icon: Pencil, editOnly: true },
-  { id: "rectangle", label: "Rectángulo", shortcut: "R", icon: Square, editOnly: true },
-  { id: "ellipse", label: "Elipse", shortcut: "O", icon: Circle, editOnly: true },
-  { id: "line", label: "Línea", shortcut: "L", icon: Minus, editOnly: true },
-  { id: "arrow", label: "Flecha", shortcut: "A", icon: ArrowUpRight, editOnly: true },
-  { id: "text", label: "Texto", shortcut: "T", icon: Type, editOnly: true },
+  {
+    id: "select",
+    label: "Seleccionar / Arrastre múltiple",
+    shortcut: "V",
+    icon: MousePointer2,
+  },
+  {
+    id: "eraser",
+    label: "Borrador",
+    shortcut: "E",
+    icon: Eraser,
+    editOnly: true,
+  },
+  {
+    id: "freehand",
+    label: "Pincel",
+    shortcut: "P",
+    icon: Paintbrush,
+    editOnly: true,
+  },
+  {
+    id: "rectangle",
+    label: "Rectángulo",
+    shortcut: "R",
+    icon: Square,
+    editOnly: true,
+  },
+  {
+    id: "ellipse",
+    label: "Elipse",
+    shortcut: "O",
+    icon: Circle,
+    editOnly: true,
+  },
+  {
+    id: "line",
+    label: "Línea",
+    shortcut: "L",
+    icon: Minus,
+    editOnly: true,
+  },
+  {
+    id: "arrow",
+    label: "Flecha",
+    shortcut: "A",
+    icon: ArrowUpRight,
+    editOnly: true,
+  },
+  {
+    id: "text",
+    label: "Texto",
+    shortcut: "T",
+    icon: Type,
+    editOnly: true,
+  },
 ];
 
 export const EditorToolbar: React.FC<EditorToolbarProps> = ({
@@ -67,10 +131,32 @@ export const EditorToolbar: React.FC<EditorToolbarProps> = ({
   onFitStage,
   backdrop,
   onBackdropChange,
+  snapEnabled,
+  onToggleSnap,
+  guidesConfig,
+  onGuidesConfigChange,
+  onOpenDocumentModal,
 }) => {
+  const [guidesMenuOpen, setGuidesMenuOpen] = useState(false);
+  const guidesRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!guidesMenuOpen) return;
+    const onDown = (e: PointerEvent) => {
+      if (!guidesRef.current?.contains(e.target as Node)) {
+        setGuidesMenuOpen(false);
+      }
+    };
+    window.addEventListener("pointerdown", onDown);
+    return () => window.removeEventListener("pointerdown", onDown);
+  }, [guidesMenuOpen]);
+
   return (
-    <div className="pointer-events-auto flex items-center gap-1 rounded-2xl bg-studio-900/95 border border-studio-700/90 px-2 py-1.5 shadow-2xl backdrop-blur-md">
-      {/* Drawing tools */}
+    <div
+      data-tour="toolbar"
+      className="pointer-events-auto flex flex-wrap items-center justify-center gap-1 max-w-full rounded-2xl bg-studio-900/95 border border-white/[0.1] px-2 py-1.5 shadow-2xl backdrop-blur-md"
+    >
+      {/* Drawing tools (no H hand tool) */}
       <div className="flex items-center gap-0.5">
         {TOOLS.map((t) => {
           const Icon = t.icon;
@@ -83,9 +169,10 @@ export const EditorToolbar: React.FC<EditorToolbarProps> = ({
               disabled={disabled}
               onClick={() => onSelectTool(t.id)}
               title={`${t.label} (${t.shortcut})`}
-              className={`relative flex items-center justify-center w-9 h-9 rounded-xl transition ${
+              aria-label={`${t.label} (${t.shortcut})`}
+              className={`relative flex items-center justify-center w-8 h-8 rounded-xl transition-colors ${
                 active
-                  ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/30"
+                  ? "bg-sky-600 text-white shadow-md shadow-sky-600/30"
                   : disabled
                     ? "text-zinc-600 cursor-not-allowed"
                     : "text-zinc-300 hover:text-white hover:bg-studio-800"
@@ -93,8 +180,8 @@ export const EditorToolbar: React.FC<EditorToolbarProps> = ({
             >
               <Icon className="w-4 h-4" />
               <span
-                className={`absolute bottom-0.5 right-1 text-[9px] font-mono leading-none ${
-                  active ? "text-indigo-200" : "text-zinc-500"
+                className={`absolute bottom-0.5 right-1 text-[8px] font-mono leading-none ${
+                  active ? "text-sky-100" : "text-zinc-500"
                 }`}
               >
                 {t.shortcut}
@@ -102,18 +189,134 @@ export const EditorToolbar: React.FC<EditorToolbarProps> = ({
             </button>
           );
         })}
+
+        {canEdit && (
+          <button
+            type="button"
+            onClick={onOpenDocumentModal}
+            title="Adjuntar documento (PDF / TXT / MD) y seleccionar páginas"
+            aria-label="Adjuntar documento"
+            className="flex items-center justify-center w-8 h-8 rounded-xl text-zinc-300 hover:text-white hover:bg-studio-800 transition-colors"
+          >
+            <FileText className="w-4 h-4 text-sky-400" />
+          </button>
+        )}
+      </div>
+
+      <div className="w-px h-5 bg-white/[0.08] mx-0.5" />
+
+      {/* Magnet Snap + Board Guides */}
+      <div className="flex items-center gap-0.5" data-tour="snap-guides">
+        <button
+          type="button"
+          onClick={onToggleSnap}
+          title="Imán / Alineación automática (M)"
+          aria-label="Alternar imán de alineación"
+          aria-pressed={snapEnabled}
+          className={`relative flex items-center justify-center w-8 h-8 rounded-xl transition-colors ${
+            snapEnabled
+              ? "bg-sky-500/20 border border-sky-400/50 text-sky-300"
+              : "text-zinc-400 hover:text-white hover:bg-studio-800"
+          }`}
+        >
+          <Magnet className="w-4 h-4" />
+          <span className="absolute bottom-0.5 right-1 text-[8px] font-mono leading-none opacity-75">
+            M
+          </span>
+        </button>
+
+        <div ref={guidesRef} className="relative flex items-center">
+          <button
+            type="button"
+            onClick={() =>
+              onGuidesConfigChange({
+                ...guidesConfig,
+                enabled: !guidesConfig.enabled,
+              })
+            }
+            title="Mostrar / ocultar líneas guías en el tablero (G)"
+            aria-label="Mostrar u ocultar líneas guías"
+            aria-pressed={guidesConfig.enabled}
+            className={`relative flex items-center justify-center w-7 h-8 rounded-l-xl transition-colors ${
+              guidesConfig.enabled
+                ? "bg-sky-500/20 border border-r-0 border-sky-400/50 text-sky-300"
+                : "text-zinc-400 hover:text-white hover:bg-studio-800"
+            }`}
+          >
+            <Grid3x3 className="w-4 h-4" />
+            <span className="absolute bottom-0.5 right-0.5 text-[8px] font-mono leading-none opacity-75">
+              G
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setGuidesMenuOpen((v) => !v)}
+            title="Opciones de líneas guías"
+            aria-label="Configurar líneas guías"
+            className={`flex items-center justify-center w-4 h-8 rounded-r-xl transition-colors ${
+              guidesConfig.enabled
+                ? "bg-sky-500/20 border border-l-0 border-sky-400/50 text-sky-300 hover:bg-sky-500/30"
+                : "text-zinc-500 hover:text-white hover:bg-studio-800"
+            }`}
+          >
+            <ChevronDown className="w-3 h-3" />
+          </button>
+
+          {guidesMenuOpen && (
+            <div className="absolute top-full left-0 mt-2 w-52 rounded-xl bg-studio-900 border border-white/[0.12] shadow-2xl p-2 space-y-1 z-50 animate-popover-enter">
+              <p className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                Líneas guías (solo editor)
+              </p>
+              {(
+                [
+                  ["showCenterAxes", "Ejes centrales (H / V)"],
+                  ["showRuleOfThirds", "Regla de tercios (3×3)"],
+                  ["showSafeZones", "Márgenes seguros OBS (90%)"],
+                ] as const
+              ).map(([key, label]) => {
+                const active = guidesConfig[key];
+                return (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() =>
+                      onGuidesConfigChange({
+                        ...guidesConfig,
+                        enabled: true,
+                        [key]: !active,
+                      })
+                    }
+                    className="w-full flex items-center justify-between px-2 py-1.5 rounded-lg text-xs text-zinc-200 hover:bg-studio-800 transition-colors"
+                  >
+                    <span>{label}</span>
+                    <span
+                      className={`w-4 h-4 rounded border flex items-center justify-center ${
+                        active
+                          ? "bg-sky-500 border-sky-400 text-white"
+                          : "border-white/20 bg-studio-950"
+                      }`}
+                    >
+                      {active && <Check className="w-3 h-3" />}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
       </div>
 
       {canEdit && (
         <>
-          <div className="w-px h-6 bg-studio-700 mx-1" />
+          <div className="w-px h-6 bg-white/[0.08] mx-1" />
           <div className="flex items-center gap-0.5">
             <button
               type="button"
               disabled={!canUndo}
               onClick={onUndo}
               title="Deshacer (Ctrl+Z)"
-              className="flex items-center justify-center w-8 h-8 rounded-lg text-zinc-300 hover:text-white hover:bg-studio-800 disabled:opacity-35 disabled:hover:bg-transparent transition"
+              aria-label="Deshacer"
+              className="flex items-center justify-center w-8 h-8 rounded-lg text-zinc-300 hover:text-white hover:bg-studio-800 disabled:opacity-35 disabled:hover:bg-transparent transition-colors"
             >
               <Undo2 className="w-4 h-4" />
             </button>
@@ -122,7 +325,8 @@ export const EditorToolbar: React.FC<EditorToolbarProps> = ({
               disabled={!canRedo}
               onClick={onRedo}
               title="Rehacer (Ctrl+Y)"
-              className="flex items-center justify-center w-8 h-8 rounded-lg text-zinc-300 hover:text-white hover:bg-studio-800 disabled:opacity-35 disabled:hover:bg-transparent transition"
+              aria-label="Rehacer"
+              className="flex items-center justify-center w-8 h-8 rounded-lg text-zinc-300 hover:text-white hover:bg-studio-800 disabled:opacity-35 disabled:hover:bg-transparent transition-colors"
             >
               <Redo2 className="w-4 h-4" />
             </button>
@@ -130,15 +334,16 @@ export const EditorToolbar: React.FC<EditorToolbarProps> = ({
         </>
       )}
 
-      <div className="w-px h-6 bg-studio-700 mx-1" />
+      <div className="w-px h-6 bg-white/[0.08] mx-1" />
 
-      {/* Zoom & Fit 16:9 */}
+      {/* Smooth Zoom & Fit 16:9 */}
       <div className="flex items-center gap-0.5">
         <button
           type="button"
           onClick={onZoomOut}
-          title="Alejar"
-          className="flex items-center justify-center w-8 h-8 rounded-lg text-zinc-300 hover:text-white hover:bg-studio-800 transition"
+          title="Alejar suavemente"
+          aria-label="Alejar zoom"
+          className="flex items-center justify-center w-8 h-8 rounded-lg text-zinc-300 hover:text-white hover:bg-studio-800 transition-colors"
         >
           <ZoomOut className="w-4 h-4" />
         </button>
@@ -146,26 +351,28 @@ export const EditorToolbar: React.FC<EditorToolbarProps> = ({
           type="button"
           onClick={onFitStage}
           title="Encuadrar marco OBS 16:9 (Ctrl+0)"
-          className="px-2 h-8 rounded-lg text-xs font-mono text-zinc-200 hover:bg-studio-800 transition flex items-center gap-1"
+          aria-label="Encuadrar marco 16:9"
+          className="px-2 h-8 rounded-lg text-xs font-mono tabular-nums text-zinc-200 hover:bg-studio-800 transition-colors flex items-center gap-1"
         >
           <span>{Math.round(zoom * 100)}%</span>
-          <Maximize2 className="w-3 h-3 text-indigo-400" />
+          <Maximize2 className="w-3 h-3 text-sky-400" />
         </button>
         <button
           type="button"
           onClick={onZoomIn}
-          title="Acercar"
-          className="flex items-center justify-center w-8 h-8 rounded-lg text-zinc-300 hover:text-white hover:bg-studio-800 transition"
+          title="Acercar suavemente"
+          aria-label="Acercar zoom"
+          className="flex items-center justify-center w-8 h-8 rounded-lg text-zinc-300 hover:text-white hover:bg-studio-800 transition-colors"
         >
           <ZoomIn className="w-4 h-4" />
         </button>
       </div>
 
-      <div className="w-px h-6 bg-studio-700 mx-1 hidden md:block" />
+      <div className="w-px h-6 bg-white/[0.08] mx-1 hidden lg:block" />
 
       {/* Preview Backdrop Switcher (Editor only, OBS is always transparent!) */}
       <div
-        className="hidden md:flex items-center gap-1 pl-0.5"
+        className="hidden lg:flex items-center gap-1 pl-0.5"
         title="Fondo de vista previa (solo en editor; en OBS siempre es transparente)"
       >
         {(
@@ -181,10 +388,11 @@ export const EditorToolbar: React.FC<EditorToolbarProps> = ({
             type="button"
             onClick={() => onBackdropChange(id)}
             title={`${title} (solo vista previa editor)`}
-            className={`w-5 h-5 rounded-md border transition ${cls} ${
+            aria-label={title}
+            className={`w-5 h-5 rounded-md border transition-transform ${cls} ${
               backdrop === id
-                ? "border-indigo-400 ring-2 ring-indigo-500/40 scale-110"
-                : "border-studio-600 opacity-70 hover:opacity-100"
+                ? "border-sky-400 ring-2 ring-sky-500/40 scale-110"
+                : "border-white/[0.14] opacity-70 hover:opacity-100"
             }`}
           />
         ))}

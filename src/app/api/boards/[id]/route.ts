@@ -2,13 +2,14 @@ import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
 import { realtimeHub } from "@/lib/realtime-hub";
 import {
+  computeElementsHash,
   deleteBoard,
   getBoardForUser,
   updateBoardTitle,
 } from "@/lib/store";
 
 export async function GET(
-  _req: Request,
+  req: Request,
   ctx: { params: Promise<{ id: string }> }
 ) {
   const user = await getCurrentUser();
@@ -23,7 +24,28 @@ export async function GET(
       { status: 404 }
     );
   }
-  return NextResponse.json({ board });
+
+  const url = new URL(req.url);
+  const clientHash = url.searchParams.get("hash");
+  const serverHash = computeElementsHash(board.elements);
+
+  if (clientHash && clientHash === serverHash) {
+    return NextResponse.json(
+      {
+        unchanged: true,
+        hash: serverHash,
+        myRole: board.myRole,
+        myPaused: board.myPaused ?? false,
+        members: board.members,
+      },
+      { headers: { "Cache-Control": "no-store, max-age=0" } }
+    );
+  }
+
+  return NextResponse.json(
+    { board, hash: serverHash },
+    { headers: { "Cache-Control": "no-store, max-age=0" } }
+  );
 }
 
 export async function PATCH(

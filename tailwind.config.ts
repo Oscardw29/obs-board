@@ -9,18 +9,18 @@ const config: Config = {
   theme: {
     extend: {
       fontFamily: {
-        sans: ["'Inter'", "system-ui", "-apple-system", "sans-serif"],
+        sans: ["'Plus Jakarta Sans'", "'Inter'", "system-ui", "-apple-system", "sans-serif"],
         hand: ["'Caveat'", "'Segoe Print'", "cursive"],
         mono: ["'JetBrains Mono'", "ui-monospace", "monospace"],
       },
       colors: {
         studio: {
-          950: "#09090d",
-          900: "#111118",
-          850: "#171721",
-          800: "#1e1e2b",
-          700: "#2b2b3d",
-          600: "#3d3d54",
+          950: "#090b10",
+          900: "#10131c",
+          850: "#161a26",
+          800: "#1e2434",
+          700: "#2a3146",
+          600: "#3c4663",
         },
       },
     },

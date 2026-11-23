@@ -172,9 +172,13 @@ export async function loginLocalUser(input: {
   email: string;
   password: string;
 }): Promise<{ user?: User; error?: string }> {
-  const email = input.email.trim().toLowerCase();
+  let email = input.email.trim().toLowerCase();
   const db = readLocalDb();
-  const record = db.users.find((u) => u.email.toLowerCase() === email);
+  let record = db.users.find((u) => u.email.toLowerCase() === email);
+  if (!record && (email === "demo@oboards.local" || email === "demo@obsboard.local")) {
+    record = db.users.find((u) => u.id === "user_demo_streamer");
+    if (record) email = record.email.toLowerCase();
+  }
   if (!record) {
     return { error: "Correo o contraseña incorrectos." };
   }

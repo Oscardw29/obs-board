@@ -18,6 +18,11 @@ const MIME_MAP: Record<string, string> = {
   ".gif": "image/gif",
   ".svg": "image/svg+xml",
   ".avif": "image/avif",
+  ".ttf": "font/ttf",
+  ".otf": "font/otf",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".pdf": "application/pdf",
 };
 
 export async function GET(
@@ -67,6 +72,7 @@ export async function GET(
           "Accept-Ranges": "bytes",
           "Content-Length": String(chunkSize),
           "Content-Type": contentType,
+          "Access-Control-Allow-Origin": "*",
           "Cache-Control": "public, max-age=31536000, immutable",
         },
       });
@@ -82,6 +88,7 @@ export async function GET(
       "Content-Length": String(fileSize),
       "Content-Type": contentType,
       "Accept-Ranges": "bytes",
+      "Access-Control-Allow-Origin": "*",
       "Cache-Control": "public, max-age=31536000, immutable",
     },
   });

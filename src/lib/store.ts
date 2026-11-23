@@ -12,6 +12,7 @@ import {
   type BoardRole,
   type BoardSummary,
   type MediaAsset,
+  type MediaFolder,
   type User,
 } from "@/types/board";
 import { isSupabaseConfigured } from "./config";
@@ -47,20 +48,112 @@ function formatSupabaseError(err: { code?: string; message: string }): string {
     err.code === "PGRST205" ||
     err.message.includes("Could not find the table")
   ) {
-    return "Faltan las tablas en Supabase. Ejecuta supabase/schema.sql en el SQL Editor de tu proyecto Supabase.";
+    return "Faltan tablas en Supabase. Ejecuta el archivo supabase/schema.sql actualizado en el SQL Editor de tu proyecto Supabase.";
   }
   if (
     err.code === "42501" ||
     err.message.toLowerCase().includes("row-level security")
   ) {
-    return `Permiso denegado por RLS en Supabase (${err.message}). Verifica que ejecutaste supabase/schema.sql completo y configuraste SUPABASE_SECRET_KEY en Vercel.`;
+    return `Permiso denegado por RLS en Supabase (${err.message}). Verifica que ejecutaste supabase/schema.sql completo y configuraste SUPABASE_SECRET_KEY.`;
   }
   return err.message;
 }
 
+export function computeElementsHash(elements: BoardElement[]): string {
+  const sorted = [...elements].sort((a, b) => a.id.localeCompare(b.id));
+  const compact = sorted.map((e) => [
+    e.id,
+    e.updatedAt,
+    e.visible ? 1 : 0,
+    e.locked ? 1 : 0,
+    Math.round(e.x),
+    Math.round(e.y),
+    Math.round(e.width),
+    Math.round(e.height),
+    Math.round(e.rotation),
+    e.zIndex,
+    e.opacity,
+    e.text ?? "",
+    e.currentPage ?? 0,
+    e.triggerId ?? "",
+    e.playing ? 1 : 0,
+    e.strokeColor ?? "",
+    e.fillColor ?? "",
+  ]);
+  return crypto
+    .createHash("sha1")
+    .update(JSON.stringify(compact))
+    .digest("hex")
+    .slice(0, 16);
+}
+
+export interface BoardAccessInfo {
+  role: BoardRole;
+  paused: boolean;
+}
+
+function canEditAccess(access: BoardAccessInfo | null): boolean {
+  return Boolean(access && access.role !== "viewer" && !access.paused);
+}
+
 // ============================================================================
-// BOARDS
+// BOARDS & ACCESS
 // ============================================================================
+
+export async function getUserBoardAccess(
+  boardId: string,
+  user: User
+): Promise<BoardAccessInfo | null> {
+  if (isSupabaseConfigured()) {
+    const supabase = await getCloudDbClient();
+    if (!supabase) return null;
+    const { data: board } = await supabase
+      .from("boards")
+      .select("id, owner_id")
+      .eq("id", boardId)
+      .maybeSingle();
+    if (!board) return null;
+    if (board.owner_id === user.id) return { role: "owner", paused: false };
+
+    const { data: member } = await supabase
+      .from("board_members")
+      .select("role, paused")
+      .eq("board_id", boardId)
+      .ilike("email", user.email.toLowerCase())
+      .maybeSingle();
+
+    if (!member) return null;
+    return {
+      role: member.role as BoardRole,
+      paused: Boolean(member.paused),
+    };
+  }
+
+  const db = readLocalDb();
+  const board = db.boards.find((b) => b.id === boardId);
+  if (!board) return null;
+  if (board.ownerId === user.id) return { role: "owner", paused: false };
+
+  const emailLower = user.email.toLowerCase();
+  const member = db.members.find(
+    (m) =>
+      m.boardId === boardId &&
+      (m.userId === user.id || m.email.toLowerCase() === emailLower)
+  );
+  if (!member) return null;
+  return {
+    role: member.role,
+    paused: Boolean(member.paused),
+  };
+}
+
+export async function getUserBoardRole(
+  boardId: string,
+  user: User
+): Promise<BoardRole | null> {
+  const access = await getUserBoardAccess(boardId, user);
+  return access?.role ?? null;
+}
 
 export async function listBoardsForUser(user: User): Promise<BoardSummary[]> {
   if (isSupabaseConfigured()) {
@@ -69,7 +162,6 @@ export async function listBoardsForUser(user: User): Promise<BoardSummary[]> {
 
     const emailLower = user.email.toLowerCase();
 
-    // Fetch boards owned by user OR where user's email is an invited member
     const { data: memberships } = await supabase
       .from("board_members")
       .select("board_id")
@@ -80,7 +172,7 @@ export async function listBoardsForUser(user: User): Promise<BoardSummary[]> {
     const { data: ownedBoards, error: ownedErr } = await supabase
       .from("boards")
       .select(
-        "id, title, owner_id, owner_email, owner_name, obs_token, stage_width, stage_height, created_at, updated_at, board_members(id, email, role), board_elements(id, data, z_index, visible)"
+        "id, title, owner_id, owner_email, owner_name, obs_token, stage_width, stage_height, created_at, updated_at, board_members(id, email, role, paused), board_elements(id, data, z_index, visible)"
       )
       .eq("owner_id", user.id)
       .order("updated_at", { ascending: false });
@@ -94,7 +186,7 @@ export async function listBoardsForUser(user: User): Promise<BoardSummary[]> {
       const { data, error: sharedErr } = await supabase
         .from("boards")
         .select(
-          "id, title, owner_id, owner_email, owner_name, obs_token, stage_width, stage_height, created_at, updated_at, board_members(id, email, role), board_elements(id, data, z_index, visible)"
+          "id, title, owner_id, owner_email, owner_name, obs_token, stage_width, stage_height, created_at, updated_at, board_members(id, email, role, paused), board_elements(id, data, z_index, visible)"
         )
         .in("id", sharedBoardIds)
         .neq("owner_id", user.id)
@@ -119,6 +211,7 @@ export async function listBoardsForUser(user: User): Promise<BoardSummary[]> {
           id: string;
           email: string;
           role: Exclude<BoardRole, "owner">;
+          paused?: boolean;
         }>;
         const rawEls = (b.board_elements ?? []) as Array<{
           data: BoardElement;
@@ -146,6 +239,7 @@ export async function listBoardsForUser(user: User): Promise<BoardSummary[]> {
           stageWidth: b.stage_width ?? STAGE_WIDTH,
           stageHeight: b.stage_height ?? STAGE_HEIGHT,
           myRole,
+          myPaused: isOwner ? false : Boolean(membership?.paused),
           memberCount: members.length,
           elementCount: elements.length,
           previewElements: elements.filter((e) => e.visible).slice(0, 25),
@@ -175,13 +269,11 @@ export async function listBoardsForUser(user: User): Promise<BoardSummary[]> {
       const elements = db.elements
         .filter((e) => e.boardId === board.id)
         .sort((a, b) => a.zIndex - b.zIndex);
+      const membership = members.find(
+        (m) => m.userId === user.id || m.email.toLowerCase() === emailLower
+      );
       const myRole: BoardRole =
-        board.ownerId === user.id
-          ? "owner"
-          : members.find(
-              (m) =>
-                m.userId === user.id || m.email.toLowerCase() === emailLower
-            )?.role ?? "viewer";
+        board.ownerId === user.id ? "owner" : membership?.role ?? "viewer";
 
       return {
         id: board.id,
@@ -193,6 +285,7 @@ export async function listBoardsForUser(user: User): Promise<BoardSummary[]> {
         stageWidth: board.stageWidth,
         stageHeight: board.stageHeight,
         myRole,
+        myPaused: board.ownerId === user.id ? false : Boolean(membership?.paused),
         memberCount: members.length,
         elementCount: elements.length,
         previewElements: elements.filter((e) => e.visible).slice(0, 25),
@@ -207,7 +300,7 @@ export async function createBoard(
   user: User,
   title: string
 ): Promise<BoardDetail> {
-  const cleanTitle = title.trim() || "Nuevo Tablero OBS";
+  const cleanTitle = title.trim() || "Nuevo Tablero OBoardS";
   const now = new Date().toISOString();
   const id = `brd_${nanoid(12)}`;
   const obsToken = nanoid(24);
@@ -243,6 +336,7 @@ export async function createBoard(
       stageWidth: STAGE_WIDTH,
       stageHeight: STAGE_HEIGHT,
       myRole: "owner",
+      myPaused: false,
       memberCount: 0,
       elementCount: 0,
       previewElements: [],
@@ -275,6 +369,7 @@ export async function createBoard(
       stageWidth: STAGE_WIDTH,
       stageHeight: STAGE_HEIGHT,
       myRole: "owner",
+      myPaused: false,
       memberCount: 0,
       elementCount: 0,
       previewElements: [],
@@ -286,52 +381,13 @@ export async function createBoard(
   });
 }
 
-export async function getUserBoardRole(
-  boardId: string,
-  user: User
-): Promise<BoardRole | null> {
-  if (isSupabaseConfigured()) {
-    const supabase = await getCloudDbClient();
-    if (!supabase) return null;
-    const { data: board } = await supabase
-      .from("boards")
-      .select("id, owner_id")
-      .eq("id", boardId)
-      .maybeSingle();
-    if (!board) return null;
-    if (board.owner_id === user.id) return "owner";
-
-    const { data: member } = await supabase
-      .from("board_members")
-      .select("role")
-      .eq("board_id", boardId)
-      .ilike("email", user.email.toLowerCase())
-      .maybeSingle();
-
-    return (member?.role as BoardRole | undefined) ?? null;
-  }
-
-  const db = readLocalDb();
-  const board = db.boards.find((b) => b.id === boardId);
-  if (!board) return null;
-  if (board.ownerId === user.id) return "owner";
-
-  const emailLower = user.email.toLowerCase();
-  const member = db.members.find(
-    (m) =>
-      m.boardId === boardId &&
-      (m.userId === user.id || m.email.toLowerCase() === emailLower)
-  );
-  return member?.role ?? null;
-}
-
 export async function getBoardForUser(
   boardId: string,
   user: User
 ): Promise<BoardDetail | null> {
   if (isSupabaseConfigured()) {
-    const role = await getUserBoardRole(boardId, user);
-    if (!role) return null;
+    const access = await getUserBoardAccess(boardId, user);
+    if (!access) return null;
     const supabase = await getCloudDbClient();
     if (!supabase) return null;
 
@@ -354,7 +410,13 @@ export async function getBoardForUser(
       .eq("board_id", boardId)
       .order("z_index", { ascending: true });
 
-    const elements = (elRows ?? []).map((r) => r.data as BoardElement);
+    const ownerNameFallback = b.owner_name ?? "Propietario";
+    const elements = (elRows ?? []).map((r) => {
+      const el = r.data as BoardElement;
+      return el.createdByName
+        ? el
+        : { ...el, createdByName: ownerNameFallback };
+    });
     const members: BoardMember[] = (memberRows ?? []).map((m) => ({
       id: m.id,
       boardId: m.board_id,
@@ -362,6 +424,7 @@ export async function getBoardForUser(
       userId: m.user_id ?? undefined,
       name: m.name ?? undefined,
       role: m.role,
+      paused: Boolean(m.paused),
       invitedAt: m.invited_at,
     }));
 
@@ -374,7 +437,8 @@ export async function getBoardForUser(
       obsToken: b.obs_token,
       stageWidth: b.stage_width ?? STAGE_WIDTH,
       stageHeight: b.stage_height ?? STAGE_HEIGHT,
-      myRole: role,
+      myRole: access.role,
+      myPaused: access.paused,
       memberCount: members.length,
       elementCount: elements.length,
       previewElements: elements.filter((e) => e.visible).slice(0, 25),
@@ -400,6 +464,7 @@ export async function getBoardForUser(
         ...m,
         userId: matchedUser?.id ?? m.userId,
         name: matchedUser?.name ?? m.name,
+        paused: Boolean(m.paused),
       };
     });
 
@@ -410,8 +475,12 @@ export async function getBoardForUser(
   if (!isOwner && !member) return null;
 
   const owner = db.users.find((u) => u.id === board.ownerId);
+  const ownerNameFallback = owner?.name ?? "Propietario";
   const elements = db.elements
     .filter((e) => e.boardId === boardId)
+    .map((e) =>
+      e.createdByName ? e : { ...e, createdByName: ownerNameFallback }
+    )
     .sort((a, b) => a.zIndex - b.zIndex);
 
   return {
@@ -424,6 +493,7 @@ export async function getBoardForUser(
     stageWidth: board.stageWidth,
     stageHeight: board.stageHeight,
     myRole: isOwner ? "owner" : member!.role,
+    myPaused: isOwner ? false : Boolean(member?.paused),
     memberCount: members.length,
     elementCount: elements.length,
     previewElements: elements.filter((e) => e.visible).slice(0, 25),
@@ -495,8 +565,8 @@ export async function updateBoardTitle(
   user: User,
   title: string
 ): Promise<{ ok: boolean; title?: string; error?: string }> {
-  const role = await getUserBoardRole(boardId, user);
-  if (!role || role === "viewer") {
+  const access = await getUserBoardAccess(boardId, user);
+  if (!canEditAccess(access)) {
     return { ok: false, error: "Sin permisos para renombrar este tablero." };
   }
   const clean = title.trim() || "Tablero sin título";
@@ -543,6 +613,7 @@ export async function deleteBoard(
     db.boards = db.boards.filter((b) => b.id !== boardId);
     db.members = db.members.filter((m) => m.boardId !== boardId);
     db.elements = db.elements.filter((e) => e.boardId !== boardId);
+    db.folders = db.folders.filter((f) => f.boardId !== boardId);
     return { ok: true };
   });
 }
@@ -602,7 +673,7 @@ export async function regenerateObsToken(
 }
 
 // ============================================================================
-// MEMBERS (INVITATIONS)
+// MEMBERS (INVITATIONS, ROLES, PAUSE & KICK)
 // ============================================================================
 
 export async function inviteBoardMember(
@@ -640,7 +711,7 @@ export async function inviteBoardMember(
     if (existing) {
       const { data, error } = await supabase
         .from("board_members")
-        .update({ role })
+        .update({ role, paused: false })
         .eq("id", existing.id)
         .select("*")
         .single();
@@ -653,6 +724,7 @@ export async function inviteBoardMember(
           userId: data.user_id ?? undefined,
           name: data.name ?? undefined,
           role: data.role,
+          paused: Boolean(data.paused),
           invitedAt: data.invited_at,
         },
       };
@@ -665,6 +737,7 @@ export async function inviteBoardMember(
         board_id: boardId,
         email,
         role,
+        paused: false,
         invited_at: now,
       })
       .select("*")
@@ -679,6 +752,7 @@ export async function inviteBoardMember(
         userId: data.user_id ?? undefined,
         name: data.name ?? undefined,
         role: data.role,
+        paused: Boolean(data.paused),
         invitedAt: data.invited_at,
       },
     };
@@ -692,6 +766,7 @@ export async function inviteBoardMember(
 
     if (existing) {
       existing.role = role;
+      existing.paused = false;
       existing.userId = matchedUser?.id;
       existing.name = matchedUser?.name;
       return { member: existing };
@@ -704,6 +779,7 @@ export async function inviteBoardMember(
       userId: matchedUser?.id,
       name: matchedUser?.name,
       role,
+      paused: false,
       invitedAt: now,
     };
     db.members.push(member);
@@ -711,11 +787,92 @@ export async function inviteBoardMember(
   });
 }
 
+export async function updateBoardMember(
+  boardId: string,
+  user: User,
+  memberId: string,
+  patch: { role?: Exclude<BoardRole, "owner">; paused?: boolean }
+): Promise<{ ok: boolean; member?: BoardMember; error?: string }> {
+  const myRole = await getUserBoardRole(boardId, user);
+  if (myRole !== "owner") {
+    return { ok: false, error: "Solo el propietario puede gestionar permisos." };
+  }
+
+  if (isSupabaseConfigured()) {
+    const supabase = await getCloudDbClient();
+    if (!supabase) return { ok: false, error: "Supabase no disponible." };
+    const updatePayload: Record<string, unknown> = {};
+    if (patch.role !== undefined) updatePayload.role = patch.role;
+    if (patch.paused !== undefined) updatePayload.paused = patch.paused;
+
+    const { data, error } = await supabase
+      .from("board_members")
+      .update(updatePayload)
+      .eq("id", memberId)
+      .eq("board_id", boardId)
+      .select("*")
+      .maybeSingle();
+    if (error || !data) {
+      return {
+        ok: false,
+        error: error ? formatSupabaseError(error) : "Miembro no encontrado.",
+      };
+    }
+
+    return {
+      ok: true,
+      member: {
+        id: data.id,
+        boardId: data.board_id,
+        email: data.email,
+        userId: data.user_id ?? undefined,
+        name: data.name ?? undefined,
+        role: data.role,
+        paused: Boolean(data.paused),
+        invitedAt: data.invited_at,
+      },
+    };
+  }
+
+  return mutateLocalDb((db) => {
+    const member = db.members.find(
+      (m) => m.boardId === boardId && m.id === memberId
+    );
+    if (!member) return { ok: false, error: "Miembro no encontrado." };
+    if (patch.role !== undefined) member.role = patch.role;
+    if (patch.paused !== undefined) member.paused = patch.paused;
+    return { ok: true, member: { ...member } };
+  });
+}
+
+function matchesAuthor(
+  el: BoardElement,
+  target: { userId?: string; email?: string }
+): boolean {
+  if (target.userId && el.createdByUserId && el.createdByUserId === target.userId) {
+    return true;
+  }
+  if (
+    target.email &&
+    el.createdByEmail &&
+    el.createdByEmail.toLowerCase() === target.email.toLowerCase()
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export async function removeBoardMember(
   boardId: string,
   user: User,
-  memberId: string
-): Promise<{ ok: boolean; error?: string }> {
+  memberId: string,
+  deleteAuthorElements = false
+): Promise<{
+  ok: boolean;
+  member?: BoardMember;
+  deletedElementIds?: string[];
+  error?: string;
+}> {
   const myRole = await getUserBoardRole(boardId, user);
   if (myRole !== "owner") {
     return { ok: false, error: "Solo el propietario puede revocar accesos." };
@@ -724,20 +881,95 @@ export async function removeBoardMember(
   if (isSupabaseConfigured()) {
     const supabase = await getCloudDbClient();
     if (!supabase) return { ok: false, error: "Supabase no disponible." };
+
+    const { data: memberRow } = await supabase
+      .from("board_members")
+      .select("*")
+      .eq("id", memberId)
+      .eq("board_id", boardId)
+      .maybeSingle();
+
+    if (!memberRow) {
+      return { ok: false, error: "Miembro no encontrado." };
+    }
+
+    let deletedElementIds: string[] = [];
+    if (deleteAuthorElements) {
+      const { data: elRows } = await supabase
+        .from("board_elements")
+        .select("id, data")
+        .eq("board_id", boardId);
+      deletedElementIds = (elRows ?? [])
+        .filter((r) =>
+          matchesAuthor(r.data as BoardElement, {
+            userId: memberRow.user_id ?? undefined,
+            email: memberRow.email,
+          })
+        )
+        .map((r) => r.id as string);
+
+      if (deletedElementIds.length > 0) {
+        await supabase
+          .from("board_elements")
+          .delete()
+          .eq("board_id", boardId)
+          .in("id", deletedElementIds);
+      }
+    }
+
     const { error } = await supabase
       .from("board_members")
       .delete()
       .eq("id", memberId)
       .eq("board_id", boardId);
     if (error) return { ok: false, error: formatSupabaseError(error) };
-    return { ok: true };
+
+    return {
+      ok: true,
+      member: {
+        id: memberRow.id,
+        boardId: memberRow.board_id,
+        email: memberRow.email,
+        userId: memberRow.user_id ?? undefined,
+        name: memberRow.name ?? undefined,
+        role: memberRow.role,
+        paused: Boolean(memberRow.paused),
+        invitedAt: memberRow.invited_at,
+      },
+      deletedElementIds,
+    };
   }
 
   return mutateLocalDb((db) => {
+    const member = db.members.find(
+      (m) => m.boardId === boardId && m.id === memberId
+    );
+    if (!member) return { ok: false, error: "Miembro no encontrado." };
+
+    let deletedElementIds: string[] = [];
+    if (deleteAuthorElements) {
+      const matchedUser = db.users.find(
+        (u) => u.email.toLowerCase() === member.email.toLowerCase()
+      );
+      const target = {
+        userId: member.userId ?? matchedUser?.id,
+        email: member.email,
+      };
+      deletedElementIds = db.elements
+        .filter((e) => e.boardId === boardId && matchesAuthor(e, target))
+        .map((e) => e.id);
+      if (deletedElementIds.length > 0) {
+        const delSet = new Set(deletedElementIds);
+        db.elements = db.elements.filter(
+          (e) => !(e.boardId === boardId && delSet.has(e.id))
+        );
+      }
+    }
+
     db.members = db.members.filter(
       (m) => !(m.boardId === boardId && m.id === memberId)
     );
-    return { ok: true };
+    return { ok: true, member, deletedElementIds };
   });
 }
 
@@ -750,14 +982,22 @@ export async function upsertElement(
   user: User,
   element: BoardElement
 ): Promise<{ ok: boolean; element?: BoardElement; error?: string }> {
-  const role = await getUserBoardRole(boardId, user);
-  if (!role || role === "viewer") {
-    return { ok: false, error: "No tienes permisos de edición en este tablero." };
+  const access = await getUserBoardAccess(boardId, user);
+  if (!canEditAccess(access)) {
+    return {
+      ok: false,
+      error: access?.paused
+        ? "Tu edición está pausada por el propietario del tablero."
+        : "No tienes permisos de edición en este tablero.",
+    };
   }
 
   const normalized: BoardElement = {
     ...element,
     boardId,
+    createdByUserId: element.createdByUserId || user.id,
+    createdByEmail: element.createdByEmail || user.email,
+    createdByName: element.createdByName || user.name,
     updatedAt: Date.now(),
   };
   const nowIso = new Date().toISOString();
@@ -796,15 +1036,82 @@ export async function upsertElement(
   });
 }
 
+export async function upsertManyElements(
+  boardId: string,
+  user: User,
+  elements: BoardElement[]
+): Promise<{ ok: boolean; elements?: BoardElement[]; error?: string }> {
+  const access = await getUserBoardAccess(boardId, user);
+  if (!canEditAccess(access)) {
+    return {
+      ok: false,
+      error: access?.paused
+        ? "Tu edición está pausada por el propietario."
+        : "No tienes permisos de edición.",
+    };
+  }
+  if (elements.length === 0) return { ok: true, elements: [] };
+
+  const nowMs = Date.now();
+  const nowIso = new Date().toISOString();
+  const normalized = elements.map((el) => ({
+    ...el,
+    boardId,
+    createdByUserId: el.createdByUserId || user.id,
+    createdByEmail: el.createdByEmail || user.email,
+    createdByName: el.createdByName || user.name,
+    updatedAt: nowMs,
+  }));
+
+  if (isSupabaseConfigured()) {
+    const supabase = await getCloudDbClient();
+    if (!supabase) return { ok: false, error: "Supabase no disponible." };
+    const { error } = await supabase.from("board_elements").upsert(
+      normalized.map((el) => ({
+        id: el.id,
+        board_id: boardId,
+        z_index: el.zIndex,
+        visible: el.visible,
+        data: el,
+        updated_at: nowIso,
+      }))
+    );
+    if (error) return { ok: false, error: formatSupabaseError(error) };
+    await supabase
+      .from("boards")
+      .update({ updated_at: nowIso })
+      .eq("id", boardId);
+    return { ok: true, elements: normalized };
+  }
+
+  return mutateLocalDb((db) => {
+    for (const el of normalized) {
+      const idx = db.elements.findIndex(
+        (e) => e.boardId === boardId && e.id === el.id
+      );
+      if (idx >= 0) db.elements[idx] = el;
+      else db.elements.push(el);
+    }
+    const board = db.boards.find((b) => b.id === boardId);
+    if (board) board.updatedAt = nowIso;
+    return { ok: true, elements: normalized };
+  });
+}
+
 export async function patchElement(
   boardId: string,
   user: User,
   elementId: string,
   patch: Partial<BoardElement>
 ): Promise<{ ok: boolean; element?: BoardElement; error?: string }> {
-  const role = await getUserBoardRole(boardId, user);
-  if (!role || role === "viewer") {
-    return { ok: false, error: "No tienes permisos de edición." };
+  const access = await getUserBoardAccess(boardId, user);
+  if (!canEditAccess(access)) {
+    return {
+      ok: false,
+      error: access?.paused
+        ? "Tu edición está pausada por el propietario."
+        : "No tienes permisos de edición.",
+    };
   }
 
   const nowIso = new Date().toISOString();
@@ -863,36 +1170,53 @@ export async function patchElement(
   });
 }
 
-export async function replaceElements(
+export async function batchPatchElements(
   boardId: string,
   user: User,
-  elements: BoardElement[]
-): Promise<{ ok: boolean; error?: string }> {
-  const role = await getUserBoardRole(boardId, user);
-  if (!role || role === "viewer") {
+  patches: Array<{ elementId: string; patch: Partial<BoardElement> }>
+): Promise<{ ok: boolean; elements?: BoardElement[]; error?: string }> {
+  const access = await getUserBoardAccess(boardId, user);
+  if (!canEditAccess(access)) {
     return { ok: false, error: "No tienes permisos de edición." };
   }
+  if (patches.length === 0) return { ok: true, elements: [] };
 
+  const patchMap = new Map<string, Partial<BoardElement>>();
+  for (const item of patches) {
+    const prev = patchMap.get(item.elementId) ?? {};
+    patchMap.set(item.elementId, { ...prev, ...item.patch });
+  }
+
+  const nowMs = Date.now();
   const nowIso = new Date().toISOString();
-  const normalized = elements.map((el) => ({
-    ...el,
-    boardId,
-    updatedAt: el.updatedAt || Date.now(),
-  }));
 
   if (isSupabaseConfigured()) {
     const supabase = await getCloudDbClient();
     if (!supabase) return { ok: false, error: "Supabase no disponible." };
 
-    const { error: delErr } = await supabase
+    const ids = Array.from(patchMap.keys());
+    const { data: rows } = await supabase
       .from("board_elements")
-      .delete()
-      .eq("board_id", boardId);
-    if (delErr) return { ok: false, error: formatSupabaseError(delErr) };
+      .select("id, data")
+      .eq("board_id", boardId)
+      .in("id", ids);
 
-    if (normalized.length > 0) {
-      const { error } = await supabase.from("board_elements").insert(
-        normalized.map((el) => ({
+    const updatedEls: BoardElement[] = [];
+    for (const r of rows ?? []) {
+      const p = patchMap.get(r.id as string);
+      if (!p) continue;
+      updatedEls.push({
+        ...(r.data as BoardElement),
+        ...p,
+        id: r.id as string,
+        boardId,
+        updatedAt: nowMs,
+      });
+    }
+
+    if (updatedEls.length > 0) {
+      const { error } = await supabase.from("board_elements").upsert(
+        updatedEls.map((el) => ({
           id: el.id,
           board_id: boardId,
           z_index: el.zIndex,
@@ -902,7 +1226,95 @@ export async function replaceElements(
         }))
       );
       if (error) return { ok: false, error: formatSupabaseError(error) };
+      await supabase
+        .from("boards")
+        .update({ updated_at: nowIso })
+        .eq("id", boardId);
     }
+
+    return { ok: true, elements: updatedEls };
+  }
+
+  return mutateLocalDb((db) => {
+    const updatedEls: BoardElement[] = [];
+    for (let i = 0; i < db.elements.length; i++) {
+      const el = db.elements[i];
+      if (el.boardId !== boardId) continue;
+      const p = patchMap.get(el.id);
+      if (!p) continue;
+      const next: BoardElement = {
+        ...el,
+        ...p,
+        id: el.id,
+        boardId,
+        updatedAt: nowMs,
+      };
+      db.elements[i] = next;
+      updatedEls.push(next);
+    }
+    const board = db.boards.find((b) => b.id === boardId);
+    if (board) board.updatedAt = nowIso;
+    return { ok: true, elements: updatedEls };
+  });
+}
+
+export async function replaceElements(
+  boardId: string,
+  user: User,
+  elements: BoardElement[]
+): Promise<{ ok: boolean; error?: string }> {
+  const access = await getUserBoardAccess(boardId, user);
+  if (!canEditAccess(access)) {
+    return { ok: false, error: "No tienes permisos de edición." };
+  }
+
+  const nowIso = new Date().toISOString();
+  const normalized = elements.map((el) => ({
+    ...el,
+    boardId,
+    createdByUserId: el.createdByUserId || user.id,
+    createdByEmail: el.createdByEmail || user.email,
+    createdByName: el.createdByName || user.name,
+    updatedAt: el.updatedAt || Date.now(),
+  }));
+
+  if (isSupabaseConfigured()) {
+    const supabase = await getCloudDbClient();
+    if (!supabase) return { ok: false, error: "Supabase no disponible." };
+
+    // Upsert new/kept elements first so there is never an empty-board race window
+    if (normalized.length > 0) {
+      const { error: upErr } = await supabase.from("board_elements").upsert(
+        normalized.map((el) => ({
+          id: el.id,
+          board_id: boardId,
+          z_index: el.zIndex,
+          visible: el.visible,
+          data: el,
+          updated_at: nowIso,
+        }))
+      );
+      if (upErr) return { ok: false, error: formatSupabaseError(upErr) };
+    }
+
+    const keepIds = new Set(normalized.map((el) => el.id));
+    const { data: existingRows } = await supabase
+      .from("board_elements")
+      .select("id")
+      .eq("board_id", boardId);
+    const staleIds = (existingRows ?? [])
+      .map((r) => r.id as string)
+      .filter((id) => !keepIds.has(id));
+
+    if (staleIds.length > 0) {
+      const { error: delErr } = await supabase
+        .from("board_elements")
+        .delete()
+        .eq("board_id", boardId)
+        .in("id", staleIds);
+      if (delErr) return { ok: false, error: formatSupabaseError(delErr) };
+    }
+
     await supabase
       .from("boards")
       .update({ updated_at: nowIso })
@@ -924,10 +1336,11 @@ export async function deleteElements(
   user: User,
   elementIds: string[]
 ): Promise<{ ok: boolean; error?: string }> {
-  const role = await getUserBoardRole(boardId, user);
-  if (!role || role === "viewer") {
+  const access = await getUserBoardAccess(boardId, user);
+  if (!canEditAccess(access)) {
     return { ok: false, error: "No tienes permisos de edición." };
   }
+  if (elementIds.length === 0) return { ok: true };
   const nowIso = new Date().toISOString();
 
   if (isSupabaseConfigured()) {
@@ -957,41 +1370,473 @@ export async function deleteElements(
   });
 }
 
-// ============================================================================
-// MEDIA LIBRARY (VIDEOS & IMAGES)
-// ============================================================================
+export async function setElementsVisibilityByAuthor(
+  boardId: string,
+  user: User,
+  target: { userId?: string; email?: string },
+  visible: boolean
+): Promise<{
+  ok: boolean;
+  patches?: Array<{ elementId: string; patch: Partial<BoardElement> }>;
+  error?: string;
+}> {
+  const role = await getUserBoardRole(boardId, user);
+  if (role !== "owner") {
+    return {
+      ok: false,
+      error: "Solo el propietario puede moderar los elementos de un colaborador.",
+    };
+  }
 
-export async function listMediaForUser(user: User): Promise<MediaAsset[]> {
+  const nowMs = Date.now();
+  const nowIso = new Date().toISOString();
+
   if (isSupabaseConfigured()) {
     const supabase = await getCloudDbClient();
-    if (!supabase) return [];
-    const { data } = await supabase
-      .from("media_assets")
-      .select("*")
-      .eq("owner_id", user.id)
-      .order("created_at", { ascending: false });
+    if (!supabase) return { ok: false, error: "Supabase no disponible." };
 
-    return (data ?? []).map((row) => ({
-      id: row.id,
-      ownerId: row.owner_id,
-      name: row.name,
-      kind: row.kind,
-      mimeType: row.mime_type,
-      url: row.url,
-      fileName: row.file_name,
-      sizeBytes: row.size_bytes,
-      width: row.width ?? undefined,
-      height: row.height ?? undefined,
-      durationSec: row.duration_sec ?? undefined,
-      tags: row.tags ?? [],
-      createdAt: row.created_at,
-    }));
+    const { data: rows } = await supabase
+      .from("board_elements")
+      .select("id, data")
+      .eq("board_id", boardId);
+
+    const matched: BoardElement[] = [];
+    for (const r of rows ?? []) {
+      const el = r.data as BoardElement;
+      if (matchesAuthor(el, target)) {
+        matched.push({ ...el, visible, updatedAt: nowMs });
+      }
+    }
+
+    if (matched.length > 0) {
+      const { error } = await supabase.from("board_elements").upsert(
+        matched.map((el) => ({
+          id: el.id,
+          board_id: boardId,
+          z_index: el.zIndex,
+          visible,
+          data: el,
+          updated_at: nowIso,
+        }))
+      );
+      if (error) return { ok: false, error: formatSupabaseError(error) };
+    }
+
+    return {
+      ok: true,
+      patches: matched.map((el) => ({
+        elementId: el.id,
+        patch: { visible },
+      })),
+    };
+  }
+
+  return mutateLocalDb((db) => {
+    const patches: Array<{ elementId: string; patch: Partial<BoardElement> }> =
+      [];
+    for (let i = 0; i < db.elements.length; i++) {
+      const el = db.elements[i];
+      if (el.boardId === boardId && matchesAuthor(el, target)) {
+        db.elements[i] = { ...el, visible, updatedAt: nowMs };
+        patches.push({ elementId: el.id, patch: { visible } });
+      }
+    }
+    const board = db.boards.find((b) => b.id === boardId);
+    if (board) board.updatedAt = nowIso;
+    return { ok: true, patches };
+  });
+}
+
+export async function deleteElementsByAuthor(
+  boardId: string,
+  user: User,
+  target: { userId?: string; email?: string }
+): Promise<{ ok: boolean; deletedIds?: string[]; error?: string }> {
+  const role = await getUserBoardRole(boardId, user);
+  if (role !== "owner") {
+    return {
+      ok: false,
+      error: "Solo el propietario puede eliminar los elementos de un colaborador.",
+    };
+  }
+
+  const nowIso = new Date().toISOString();
+
+  if (isSupabaseConfigured()) {
+    const supabase = await getCloudDbClient();
+    if (!supabase) return { ok: false, error: "Supabase no disponible." };
+
+    const { data: rows } = await supabase
+      .from("board_elements")
+      .select("id, data")
+      .eq("board_id", boardId);
+
+    const deletedIds = (rows ?? [])
+      .filter((r) => matchesAuthor(r.data as BoardElement, target))
+      .map((r) => r.id as string);
+
+    if (deletedIds.length > 0) {
+      const { error } = await supabase
+        .from("board_elements")
+        .delete()
+        .eq("board_id", boardId)
+        .in("id", deletedIds);
+      if (error) return { ok: false, error: formatSupabaseError(error) };
+    }
+
+    return { ok: true, deletedIds };
+  }
+
+  return mutateLocalDb((db) => {
+    const deletedIds = db.elements
+      .filter((e) => e.boardId === boardId && matchesAuthor(e, target))
+      .map((e) => e.id);
+    const delSet = new Set(deletedIds);
+    db.elements = db.elements.filter(
+      (e) => !(e.boardId === boardId && delSet.has(e.id))
+    );
+    const board = db.boards.find((b) => b.id === boardId);
+    if (board) board.updatedAt = nowIso;
+    return { ok: true, deletedIds };
+  });
+}
+
+// ============================================================================
+// SHARED MEDIA LIBRARY & FOLDERS
+// ============================================================================
+
+function mapSupabaseMediaRow(row: Record<string, unknown>): MediaAsset {
+  return {
+    id: row.id as string,
+    ownerId: row.owner_id as string,
+    boardId: (row.board_id as string | null | undefined) ?? null,
+    folderId: (row.folder_id as string | null | undefined) ?? null,
+    name: row.name as string,
+    kind: row.kind as MediaAsset["kind"],
+    mimeType: row.mime_type as string,
+    url: row.url as string,
+    fileName: row.file_name as string,
+    sizeBytes: Number(row.size_bytes ?? 0),
+    width: (row.width as number | null | undefined) ?? undefined,
+    height: (row.height as number | null | undefined) ?? undefined,
+    durationSec: (row.duration_sec as number | null | undefined) ?? undefined,
+    tags: (row.tags as string[] | null | undefined) ?? [],
+    color: (row.color as string | null | undefined) ?? undefined,
+    uploadedByName:
+      (row.uploaded_by_name as string | null | undefined) ?? undefined,
+    metadata:
+      (row.metadata as MediaAsset["metadata"] | null | undefined) ?? undefined,
+    createdAt: row.created_at as string,
+  };
+}
+
+function mapSupabaseFolderRow(row: Record<string, unknown>): MediaFolder {
+  return {
+    id: row.id as string,
+    boardId: (row.board_id as string | null | undefined) ?? null,
+    ownerId: row.owner_id as string,
+    name: row.name as string,
+    color: (row.color as string) || "#38bdf8",
+    createdAt: row.created_at as string,
+  };
+}
+
+export async function listBoardMediaLibrary(
+  user: User,
+  boardId?: string | null
+): Promise<{ assets: MediaAsset[]; folders: MediaFolder[] }> {
+  if (boardId) {
+    const access = await getUserBoardAccess(boardId, user);
+    if (!access) return { assets: [], folders: [] };
+  }
+
+  if (isSupabaseConfigured()) {
+    const supabase = await getCloudDbClient();
+    if (!supabase) return { assets: [], folders: [] };
+
+    if (boardId) {
+      const [boardAssetsRes, ownAssetsRes, boardFoldersRes, ownFoldersRes] =
+        await Promise.all([
+          supabase
+            .from("media_assets")
+            .select("*")
+            .eq("board_id", boardId)
+            .order("created_at", { ascending: false }),
+          supabase
+            .from("media_assets")
+            .select("*")
+            .eq("owner_id", user.id)
+            .is("board_id", null)
+            .order("created_at", { ascending: false }),
+          supabase
+            .from("media_folders")
+            .select("*")
+            .eq("board_id", boardId)
+            .order("created_at", { ascending: true }),
+          supabase
+            .from("media_folders")
+            .select("*")
+            .eq("owner_id", user.id)
+            .is("board_id", null)
+            .order("created_at", { ascending: true }),
+        ]);
+
+      const assetMap = new Map<string, MediaAsset>();
+      for (const row of [
+        ...(boardAssetsRes.data ?? []),
+        ...(ownAssetsRes.data ?? []),
+      ]) {
+        const mapped = mapSupabaseMediaRow(row as Record<string, unknown>);
+        assetMap.set(mapped.id, mapped);
+      }
+
+      const folderMap = new Map<string, MediaFolder>();
+      for (const row of [
+        ...(boardFoldersRes.data ?? []),
+        ...(ownFoldersRes.data ?? []),
+      ]) {
+        const mapped = mapSupabaseFolderRow(row as Record<string, unknown>);
+        folderMap.set(mapped.id, mapped);
+      }
+
+      return {
+        assets: Array.from(assetMap.values()).sort((a, b) =>
+          b.createdAt.localeCompare(a.createdAt)
+        ),
+        folders: Array.from(folderMap.values()).sort((a, b) =>
+          a.createdAt.localeCompare(b.createdAt)
+        ),
+      };
+    }
+
+    const [assetsRes, foldersRes] = await Promise.all([
+      supabase
+        .from("media_assets")
+        .select("*")
+        .eq("owner_id", user.id)
+        .order("created_at", { ascending: false }),
+      supabase
+        .from("media_folders")
+        .select("*")
+        .eq("owner_id", user.id)
+        .order("created_at", { ascending: true }),
+    ]);
+
+    return {
+      assets: (assetsRes.data ?? []).map((r) =>
+        mapSupabaseMediaRow(r as Record<string, unknown>)
+      ),
+      folders: (foldersRes.data ?? []).map((r) =>
+        mapSupabaseFolderRow(r as Record<string, unknown>)
+      ),
+    };
   }
 
   const db = readLocalDb();
-  return db.media
-    .filter((m) => m.ownerId === user.id)
+  const assets = db.media
+    .filter((m) =>
+      boardId
+        ? m.boardId === boardId || (m.ownerId === user.id && !m.boardId)
+        : m.ownerId === user.id
+    )
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+  const folders = db.folders
+    .filter((f) =>
+      boardId
+        ? f.boardId === boardId || (f.ownerId === user.id && !f.boardId)
+        : f.ownerId === user.id
+    )
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
+  return { assets, folders };
+}
+
+export async function listMediaForUser(user: User): Promise<MediaAsset[]> {
+  const { assets } = await listBoardMediaLibrary(user);
+  return assets;
+}
+
+export async function createMediaFolder(
+  user: User,
+  input: { name: string; color?: string; boardId?: string | null }
+): Promise<{ folder?: MediaFolder; error?: string }> {
+  if (input.boardId) {
+    const access = await getUserBoardAccess(input.boardId, user);
+    if (!canEditAccess(access)) {
+      return { error: "No tienes permisos para crear carpetas en este tablero." };
+    }
+  }
+
+  const folder: MediaFolder = {
+    id: `fld_${nanoid(12)}`,
+    boardId: input.boardId ?? null,
+    ownerId: user.id,
+    name: input.name.trim() || "Nueva carpeta",
+    color: input.color || "#38bdf8",
+    createdAt: new Date().toISOString(),
+  };
+
+  if (isSupabaseConfigured()) {
+    const supabase = await getCloudDbClient();
+    if (!supabase) return { error: "Supabase no disponible." };
+    const { error } = await supabase.from("media_folders").insert({
+      id: folder.id,
+      board_id: folder.boardId,
+      owner_id: folder.ownerId,
+      name: folder.name,
+      color: folder.color,
+      created_at: folder.createdAt,
+    });
+    if (error) return { error: formatSupabaseError(error) };
+    return { folder };
+  }
+
+  return mutateLocalDb((db) => {
+    db.folders.push(folder);
+    return { folder };
+  });
+}
+
+export async function updateMediaFolder(
+  user: User,
+  folderId: string,
+  patch: { name?: string; color?: string }
+): Promise<{ ok: boolean; folder?: MediaFolder; error?: string }> {
+  if (isSupabaseConfigured()) {
+    const supabase = await getCloudDbClient();
+    if (!supabase) return { ok: false, error: "Supabase no disponible." };
+    const { data: existing } = await supabase
+      .from("media_folders")
+      .select("*")
+      .eq("id", folderId)
+      .maybeSingle();
+    if (!existing) return { ok: false, error: "Carpeta no encontrada." };
+
+    const canEdit =
+      existing.owner_id === user.id ||
+      (existing.board_id
+        ? canEditAccess(await getUserBoardAccess(existing.board_id, user))
+        : false);
+    if (!canEdit) return { ok: false, error: "Sin permisos para editar esta carpeta." };
+
+    const updateData: Record<string, unknown> = {};
+    if (patch.name !== undefined && patch.name.trim()) {
+      updateData.name = patch.name.trim();
+    }
+    if (patch.color !== undefined) {
+      updateData.color = patch.color;
+    }
+
+    const { data, error } = await supabase
+      .from("media_folders")
+      .update(updateData)
+      .eq("id", folderId)
+      .select("*")
+      .single();
+    if (error || !data) {
+      return {
+        ok: false,
+        error: error ? formatSupabaseError(error) : "Error actualizando carpeta.",
+      };
+    }
+    return {
+      ok: true,
+      folder: mapSupabaseFolderRow(data as Record<string, unknown>),
+    };
+  }
+
+  const dbCheck = readLocalDb();
+  const target = dbCheck.folders.find((f) => f.id === folderId);
+  if (!target) return { ok: false, error: "Carpeta no encontrada." };
+  if (target.ownerId !== user.id) {
+    if (!target.boardId) return { ok: false, error: "Sin permisos." };
+    const access = await getUserBoardAccess(target.boardId, user);
+    if (!canEditAccess(access)) return { ok: false, error: "Sin permisos." };
+  }
+
+  return mutateLocalDb((db) => {
+    const folder = db.folders.find((f) => f.id === folderId);
+    if (!folder) return { ok: false, error: "Carpeta no encontrada." };
+    if (patch.name !== undefined && patch.name.trim()) {
+      folder.name = patch.name.trim();
+    }
+    if (patch.color !== undefined) {
+      folder.color = patch.color;
+    }
+    return { ok: true, folder };
+  });
+}
+
+export async function deleteMediaFolder(
+  user: User,
+  folderId: string
+): Promise<{ ok: boolean; boardId?: string | null; error?: string }> {
+  if (isSupabaseConfigured()) {
+    const supabase = await getCloudDbClient();
+    if (!supabase) return { ok: false, error: "Supabase no disponible." };
+    const { data: existing } = await supabase
+      .from("media_folders")
+      .select("*")
+      .eq("id", folderId)
+      .maybeSingle();
+    if (!existing) return { ok: false, error: "Carpeta no encontrada." };
+
+    const canEdit =
+      existing.owner_id === user.id ||
+      (existing.board_id
+        ? canEditAccess(await getUserBoardAccess(existing.board_id, user))
+        : false);
+    if (!canEdit) return { ok: false, error: "Sin permisos para eliminar carpeta." };
+
+    await supabase
+      .from("media_assets")
+      .update({ folder_id: null })
+      .eq("folder_id", folderId);
+
+    const { error } = await supabase
+      .from("media_folders")
+      .delete()
+      .eq("id", folderId);
+    if (error) return { ok: false, error: formatSupabaseError(error) };
+    return { ok: true, boardId: existing.board_id };
+  }
+
+  const dbCheck = readLocalDb();
+  const target = dbCheck.folders.find((f) => f.id === folderId);
+  if (!target) return { ok: false, error: "Carpeta no encontrada." };
+  if (target.ownerId !== user.id) {
+    if (!target.boardId) return { ok: false, error: "Sin permisos." };
+    const access = await getUserBoardAccess(target.boardId, user);
+    if (!canEditAccess(access)) return { ok: false, error: "Sin permisos." };
+  }
+
+  return mutateLocalDb((db) => {
+    const removed = db.folders.find((f) => f.id === folderId);
+    db.folders = db.folders.filter((f) => f.id !== folderId);
+    for (const asset of db.media) {
+      if (asset.folderId === folderId) {
+        asset.folderId = null;
+      }
+    }
+    return { ok: true, boardId: removed?.boardId ?? null };
+  });
+}
+
+export async function saveRawLocalUpload(
+  originalFileName: string,
+  buffer: Buffer
+): Promise<{ url: string; fileName: string }> {
+  const id = `raw_${nanoid(12)}`;
+  const rawExt = path.extname(originalFileName).toLowerCase();
+  const safeExt = /^[.][a-z0-9]{1,8}$/.test(rawExt) ? rawExt : ".png";
+  const storedFileName = `${id}${safeExt}`;
+  const uploadsDir = getUploadsDir();
+  fs.writeFileSync(path.join(uploadsDir, storedFileName), buffer);
+  return {
+    url: `/api/media/file/${storedFileName}`,
+    fileName: storedFileName,
+  };
 }
 
 export async function saveMediaAsset(
@@ -1000,21 +1845,34 @@ export async function saveMediaAsset(
     name: string;
     originalFileName: string;
     mimeType: string;
-    kind: "video" | "image";
+    kind: MediaAsset["kind"];
     buffer: Buffer;
     width?: number;
     height?: number;
     durationSec?: number;
     tags?: string[];
+    boardId?: string | null;
+    folderId?: string | null;
+    color?: string;
+    metadata?: MediaAsset["metadata"];
   }
 ): Promise<MediaAsset> {
+  if (input.boardId) {
+    const access = await getUserBoardAccess(input.boardId, user);
+    if (!canEditAccess(access)) {
+      throw new Error("No tienes permisos para subir archivos a este tablero.");
+    }
+  }
+
   const id = `med_${nanoid(12)}`;
   const rawExt = path.extname(input.originalFileName).toLowerCase();
   const safeExt = /^[.][a-z0-9]{1,8}$/.test(rawExt)
     ? rawExt
     : input.kind === "video"
       ? ".mp4"
-      : ".png";
+      : input.kind === "font"
+        ? ".ttf"
+        : ".png";
   const storedFileName = `${id}${safeExt}`;
   const now = new Date().toISOString();
 
@@ -1038,6 +1896,8 @@ export async function saveMediaAsset(
     const asset: MediaAsset = {
       id,
       ownerId: user.id,
+      boardId: input.boardId ?? null,
+      folderId: input.folderId ?? null,
       name: input.name.trim() || input.originalFileName,
       kind: input.kind,
       mimeType: input.mimeType,
@@ -1048,12 +1908,17 @@ export async function saveMediaAsset(
       height: input.height,
       durationSec: input.durationSec,
       tags: input.tags ?? [],
+      color: input.color,
+      uploadedByName: user.name,
+      metadata: input.metadata,
       createdAt: now,
     };
 
     const { error: dbError } = await supabase.from("media_assets").insert({
       id: asset.id,
       owner_id: asset.ownerId,
+      board_id: asset.boardId,
+      folder_id: asset.folderId,
       name: asset.name,
       kind: asset.kind,
       mime_type: asset.mimeType,
@@ -1064,13 +1929,15 @@ export async function saveMediaAsset(
       height: asset.height ?? null,
       duration_sec: asset.durationSec ?? null,
       tags: asset.tags,
+      color: asset.color ?? null,
+      uploaded_by_name: asset.uploadedByName ?? null,
+      metadata: asset.metadata ?? {},
       created_at: asset.createdAt,
     });
     if (dbError) throw new Error(formatSupabaseError(dbError));
     return asset;
   }
 
-  // Local filesystem storage
   const uploadsDir = getUploadsDir();
   const destPath = path.join(uploadsDir, storedFileName);
   fs.writeFileSync(destPath, input.buffer);
@@ -1078,6 +1945,8 @@ export async function saveMediaAsset(
   const asset: MediaAsset = {
     id,
     ownerId: user.id,
+    boardId: input.boardId ?? null,
+    folderId: input.folderId ?? null,
     name: input.name.trim() || input.originalFileName,
     kind: input.kind,
     mimeType: input.mimeType,
@@ -1088,6 +1957,9 @@ export async function saveMediaAsset(
     height: input.height,
     durationSec: input.durationSec,
     tags: input.tags ?? [],
+    color: input.color,
+    uploadedByName: user.name,
+    metadata: input.metadata,
     createdAt: now,
   };
 
@@ -1102,7 +1974,7 @@ export async function registerCloudMediaAsset(
   input: {
     id: string;
     name: string;
-    kind: "video" | "image";
+    kind: MediaAsset["kind"];
     mimeType: string;
     url: string;
     fileName: string;
@@ -1111,23 +1983,25 @@ export async function registerCloudMediaAsset(
     height?: number;
     durationSec?: number;
     tags?: string[];
+    boardId?: string | null;
+    folderId?: string | null;
+    color?: string;
+    metadata?: MediaAsset["metadata"];
   }
 ): Promise<MediaAsset> {
-  if (!isSupabaseConfigured()) {
-    throw new Error("Registro directo solo disponible en modo nube.");
-  }
-  const supabase = await getCloudDbClient();
-  if (!supabase) throw new Error("Supabase no configurado");
-
-  // Ensure the storage path belongs to the authenticated user
-  if (!input.fileName.startsWith(`${user.id}/`)) {
-    throw new Error("Ruta de archivo no autorizada.");
+  if (input.boardId) {
+    const access = await getUserBoardAccess(input.boardId, user);
+    if (!canEditAccess(access)) {
+      throw new Error("Sin permisos para registrar media en este tablero.");
+    }
   }
 
   const now = new Date().toISOString();
   const asset: MediaAsset = {
     id: input.id || `med_${nanoid(12)}`,
     ownerId: user.id,
+    boardId: input.boardId ?? null,
+    folderId: input.folderId ?? null,
     name: input.name.trim() || "Archivo media",
     kind: input.kind,
     mimeType: input.mimeType,
@@ -1138,12 +2012,34 @@ export async function registerCloudMediaAsset(
     height: input.height,
     durationSec: input.durationSec,
     tags: input.tags ?? [],
+    color: input.color,
+    uploadedByName: user.name,
+    metadata: input.metadata,
     createdAt: now,
   };
+
+  if (!isSupabaseConfigured()) {
+    return mutateLocalDb((db) => {
+      db.media.push(asset);
+      return asset;
+    });
+  }
+
+  const supabase = await getCloudDbClient();
+  if (!supabase) throw new Error("Supabase no configurado");
+
+  if (
+    input.kind !== "document" &&
+    !input.fileName.startsWith(`${user.id}/`)
+  ) {
+    throw new Error("Ruta de archivo no autorizada.");
+  }
 
   const { error } = await supabase.from("media_assets").insert({
     id: asset.id,
     owner_id: asset.ownerId,
+    board_id: asset.boardId,
+    folder_id: asset.folderId,
     name: asset.name,
     kind: asset.kind,
     mime_type: asset.mimeType,
@@ -1154,6 +2050,9 @@ export async function registerCloudMediaAsset(
     height: asset.height ?? null,
     duration_sec: asset.durationSec ?? null,
     tags: asset.tags,
+    color: asset.color ?? null,
+    uploaded_by_name: asset.uploadedByName ?? null,
+    metadata: asset.metadata ?? {},
     created_at: asset.createdAt,
   });
   if (error) throw new Error(formatSupabaseError(error));
@@ -1164,20 +2063,45 @@ export async function registerCloudMediaAsset(
 export async function updateMediaAsset(
   user: User,
   assetId: string,
-  patch: { name?: string; tags?: string[] }
+  patch: {
+    name?: string;
+    tags?: string[];
+    folderId?: string | null;
+    color?: string | null;
+    boardId?: string | null;
+  }
 ): Promise<{ ok: boolean; asset?: MediaAsset; error?: string }> {
   if (isSupabaseConfigured()) {
     const supabase = await getCloudDbClient();
     if (!supabase) return { ok: false, error: "Supabase no disponible." };
+
+    const { data: existing } = await supabase
+      .from("media_assets")
+      .select("*")
+      .eq("id", assetId)
+      .maybeSingle();
+    if (!existing) return { ok: false, error: "Archivo no encontrado." };
+
+    const canEdit =
+      existing.owner_id === user.id ||
+      (existing.board_id
+        ? canEditAccess(await getUserBoardAccess(existing.board_id, user))
+        : false);
+    if (!canEdit) return { ok: false, error: "Sin permisos para editar este archivo." };
+
     const updateData: Record<string, unknown> = {};
-    if (patch.name !== undefined) updateData.name = patch.name.trim();
+    if (patch.name !== undefined && patch.name.trim()) {
+      updateData.name = patch.name.trim();
+    }
     if (patch.tags !== undefined) updateData.tags = patch.tags;
+    if (patch.folderId !== undefined) updateData.folder_id = patch.folderId;
+    if (patch.color !== undefined) updateData.color = patch.color;
+    if (patch.boardId !== undefined) updateData.board_id = patch.boardId;
 
     const { data, error } = await supabase
       .from("media_assets")
       .update(updateData)
       .eq("id", assetId)
-      .eq("owner_id", user.id)
       .select("*")
       .maybeSingle();
     if (error || !data) {
@@ -1189,35 +2113,29 @@ export async function updateMediaAsset(
 
     return {
       ok: true,
-      asset: {
-        id: data.id,
-        ownerId: data.owner_id,
-        name: data.name,
-        kind: data.kind,
-        mimeType: data.mime_type,
-        url: data.url,
-        fileName: data.file_name,
-        sizeBytes: data.size_bytes,
-        width: data.width ?? undefined,
-        height: data.height ?? undefined,
-        durationSec: data.duration_sec ?? undefined,
-        tags: data.tags ?? [],
-        createdAt: data.created_at,
-      },
+      asset: mapSupabaseMediaRow(data as Record<string, unknown>),
     };
   }
 
+  const dbCheck = readLocalDb();
+  const target = dbCheck.media.find((m) => m.id === assetId);
+  if (!target) return { ok: false, error: "Archivo no encontrado." };
+  if (target.ownerId !== user.id) {
+    if (!target.boardId) return { ok: false, error: "Sin permisos." };
+    const access = await getUserBoardAccess(target.boardId, user);
+    if (!canEditAccess(access)) return { ok: false, error: "Sin permisos." };
+  }
+
   return mutateLocalDb((db) => {
-    const asset = db.media.find(
-      (m) => m.id === assetId && m.ownerId === user.id
-    );
+    const asset = db.media.find((m) => m.id === assetId);
     if (!asset) return { ok: false, error: "Archivo no encontrado." };
     if (patch.name !== undefined && patch.name.trim()) {
       asset.name = patch.name.trim();
     }
-    if (patch.tags !== undefined) {
-      asset.tags = patch.tags;
-    }
+    if (patch.tags !== undefined) asset.tags = patch.tags;
+    if (patch.folderId !== undefined) asset.folderId = patch.folderId;
+    if (patch.color !== undefined) asset.color = patch.color ?? undefined;
+    if (patch.boardId !== undefined) asset.boardId = patch.boardId;
     return { ok: true, asset };
   });
 }
@@ -1225,40 +2143,56 @@ export async function updateMediaAsset(
 export async function deleteMediaAsset(
   user: User,
   assetId: string
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; boardId?: string | null; error?: string }> {
   if (isSupabaseConfigured()) {
     const supabase = await getCloudDbClient();
     if (!supabase) return { ok: false, error: "Supabase no disponible." };
     const { data: asset } = await supabase
       .from("media_assets")
-      .select("file_name")
+      .select("file_name, owner_id, board_id, kind")
       .eq("id", assetId)
-      .eq("owner_id", user.id)
       .maybeSingle();
     if (!asset) return { ok: false, error: "Archivo no encontrado." };
 
-    await supabase.storage.from("obs-media").remove([asset.file_name]);
+    const canEdit =
+      asset.owner_id === user.id ||
+      (asset.board_id
+        ? canEditAccess(await getUserBoardAccess(asset.board_id, user))
+        : false);
+    if (!canEdit) return { ok: false, error: "Sin permisos para eliminar." };
+
+    if (asset.kind !== "document" && asset.file_name) {
+      await supabase.storage.from("obs-media").remove([asset.file_name]);
+    }
     const { error } = await supabase
       .from("media_assets")
       .delete()
-      .eq("id", assetId)
-      .eq("owner_id", user.id);
+      .eq("id", assetId);
     if (error) return { ok: false, error: formatSupabaseError(error) };
-    return { ok: true };
+    return { ok: true, boardId: asset.board_id };
+  }
+
+  const dbCheck = readLocalDb();
+  const target = dbCheck.media.find((m) => m.id === assetId);
+  if (!target) return { ok: false, error: "Archivo no encontrado." };
+  if (target.ownerId !== user.id) {
+    if (!target.boardId) return { ok: false, error: "Sin permisos." };
+    const access = await getUserBoardAccess(target.boardId, user);
+    if (!canEditAccess(access)) return { ok: false, error: "Sin permisos." };
   }
 
   return mutateLocalDb((db) => {
-    const idx = db.media.findIndex(
-      (m) => m.id === assetId && m.ownerId === user.id
-    );
+    const idx = db.media.findIndex((m) => m.id === assetId);
     if (idx < 0) return { ok: false, error: "Archivo no encontrado." };
     const [removed] = db.media.splice(idx, 1);
-    const filePath = path.join(getUploadsDir(), path.basename(removed.fileName));
-    try {
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-    } catch {
-      // Ignore unlink race
+    if (removed.kind !== "document") {
+      const filePath = path.join(getUploadsDir(), path.basename(removed.fileName));
+      try {
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      } catch {
+        // Ignore unlink race
+      }
     }
-    return { ok: true };
+    return { ok: true, boardId: removed.boardId ?? null };
   });
 }

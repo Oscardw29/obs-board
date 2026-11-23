@@ -8,46 +8,76 @@ import {
   Check,
   Copy,
   ExternalLink,
+  HelpCircle,
   PanelLeft,
   PanelRight,
+  PauseCircle,
   Radio,
   Share2,
+  ShieldAlert,
   WifiOff,
 } from "lucide-react";
+import { uploadMediaFile } from "@/lib/client-media-upload";
 import {
   connectBoardRealtime,
   type RealtimeConnection,
 } from "@/lib/client-realtime";
+import { ensureCustomFontLoaded } from "@/lib/fonts";
 import {
-  getElementDefaultName,
+  doRectsIntersect,
+  doesCircleHitElement,
+  getElementWorldBounds,
+  getGroupBounds,
+  getNextElementName,
   getNextZIndex,
   normalizeStrokePoints,
+  splitFreehandStrokeByEraser,
 } from "@/lib/geometry";
+import {
+  computeMoveSnap,
+  computeResizeSnap,
+  computeRotateSnap,
+  type SnapGuide,
+} from "@/lib/snap-engine";
+import { BoardSyncQueue } from "@/lib/sync-queue";
 import {
   STAGE_HEIGHT,
   STAGE_WIDTH,
   type BoardDetail,
   type BoardElement,
+  type BoardMember,
+  type BoardRole,
   type CollaboratorCursor,
+  type DocumentPage,
   type MediaAsset,
+  type MediaFolder,
+  type OnlineMember,
   type RealtimeEvent,
   type StrokePoint,
   type ToolType,
   type User,
 } from "@/types/board";
-import { EditorToolbar, type EditorBackdrop } from "./EditorToolbar";
+import { BrandLogo } from "./BrandLogo";
+import { CollaboratorsBar } from "./CollaboratorsBar";
+import { DocumentAttachModal } from "./DocumentAttachModal";
 import {
-  LayersInspectorPanel,
-  type DrawDefaults,
-} from "./LayersInspectorPanel";
-import { uploadMediaFile } from "@/lib/client-media-upload";
-import { MediaLibraryPanel } from "./MediaLibraryPanel";
+  EditorToolbar,
+  type BoardGuidesConfig,
+  type EditorBackdrop,
+} from "./EditorToolbar";
+import { LeftDockPanel } from "./LeftDockPanel";
+import { OnboardingTutorial } from "./OnboardingTutorial";
 import { ShareModal } from "./ShareModal";
 import { StageElement } from "./StageElement";
+import {
+  StyleInspectorPanel,
+  type DrawDefaults,
+} from "./StyleInspectorPanel";
 
 interface BoardEditorProps {
   initialBoard: BoardDetail;
   initialAssets: MediaAsset[];
+  initialFolders: MediaFolder[];
   user: User;
 }
 
@@ -55,18 +85,35 @@ type ResizeHandle = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
 
 type InteractionState =
   | { kind: "none" }
-  | { kind: "pan"; startClientX: number; startClientY: number; startPanX: number; startPanY: number }
+  | {
+      kind: "pan";
+      pointerId: number;
+      startClientX: number;
+      startClientY: number;
+      startPanX: number;
+      startPanY: number;
+    }
+  | {
+      kind: "marquee";
+      pointerId: number;
+      startX: number;
+      startY: number;
+      curX: number;
+      curY: number;
+      additive: boolean;
+      baseSelectedIds: string[];
+    }
   | {
       kind: "move";
-      elementId: string;
+      pointerId: number;
       startStageX: number;
       startStageY: number;
-      origX: number;
-      origY: number;
+      items: Array<{ id: string; origX: number; origY: number }>;
       moved: boolean;
     }
   | {
       kind: "resize";
+      pointerId: number;
       elementId: string;
       handle: ResizeHandle;
       startStageX: number;
@@ -85,6 +132,7 @@ type InteractionState =
     }
   | {
       kind: "rotate";
+      pointerId: number;
       elementId: string;
       centerX: number;
       centerY: number;
@@ -93,40 +141,63 @@ type InteractionState =
     }
   | {
       kind: "draw-freehand";
+      pointerId: number;
       elementId: string;
       rawPoints: StrokePoint[];
     }
   | {
       kind: "draw-shape";
+      pointerId: number;
       elementId: string;
       shapeType: "rectangle" | "ellipse" | "line" | "arrow";
       startX: number;
       startY: number;
+    }
+  | {
+      kind: "erase";
+      pointerId: number;
+      trail: Array<{ x: number; y: number }>;
+      hitIds: Set<string>;
     };
+
+const TUTORIAL_SEEN_KEY = "oboards_tutorial_v1_seen";
 
 export const BoardEditor: React.FC<BoardEditorProps> = ({
   initialBoard,
   initialAssets,
+  initialFolders,
   user,
 }) => {
   const clientId = useMemo(() => `ed_${nanoid(10)}`, []);
-  const canEdit = initialBoard.myRole !== "viewer";
+
+  const [myRole, setMyRole] = useState<BoardRole>(initialBoard.myRole);
+  const [myPaused, setMyPaused] = useState<boolean>(
+    Boolean(initialBoard.myPaused)
+  );
+  const [kickedOut, setKickedOut] = useState(false);
+
+  const canEdit = myRole !== "viewer" && !myPaused && !kickedOut;
 
   const [title, setTitle] = useState(initialBoard.title);
   const [editingTitle, setEditingTitle] = useState(false);
   const [obsToken, setObsToken] = useState(initialBoard.obsToken);
   const [members, setMembers] = useState(initialBoard.members);
+  const [onlineMembers, setOnlineMembers] = useState<OnlineMember[]>([]);
 
   const [elements, setElements] = useState<BoardElement[]>(initialBoard.elements);
   const [assets, setAssets] = useState<MediaAsset[]>(initialAssets);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [folders, setFolders] = useState<MediaFolder[]>(initialFolders);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [editingTextId, setEditingTextId] = useState<string | null>(null);
 
   const [tool, setTool] = useState<ToolType>("select");
   const [backdrop, setBackdrop] = useState<EditorBackdrop>("checker-dark");
-  const [showMediaPanel, setShowMediaPanel] = useState(true);
+  const [showLeftPanel, setShowLeftPanel] = useState(true);
   const [showRightPanel, setShowRightPanel] = useState(true);
   const [shareOpen, setShareOpen] = useState(false);
+  const [docModalOpen, setDocModalOpen] = useState(false);
+  const [pendingDocFile, setPendingDocFile] = useState<File | null>(null);
+  const [tutorialOpen, setTutorialOpen] = useState(false);
   const [copiedObs, setCopiedObs] = useState(false);
   const [spacePressed, setSpacePressed] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<
@@ -134,71 +205,199 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
   >("connecting");
   const [saveError, setSaveError] = useState<string | null>(null);
 
+  // Magnet Snap (enabled by default!) & Board Guides
+  const [snapEnabled, setSnapEnabled] = useState(true);
+  const [guidesConfig, setGuidesConfig] = useState<BoardGuidesConfig>({
+    enabled: false,
+    showCenterAxes: true,
+    showRuleOfThirds: true,
+    showSafeZones: true,
+  });
+  const [activeSnapGuides, setActiveSnapGuides] = useState<SnapGuide[]>([]);
+
+  // Marquee rectangle & Eraser live visual state
+  const [marqueeBox, setMarqueeBox] = useState<{
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null>(null);
+  const [eraserCursorPos, setEraserCursorPos] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
+  const [eraserPreviewIds, setEraserPreviewIds] = useState<Set<string>>(
+    new Set()
+  );
+
   const [drawDefaults, setDrawDefaults] = useState<DrawDefaults>({
-    strokeColor: "#ffffff",
+    strokeColor: "#38bdf8",
     fillColor: "transparent",
     strokeWidth: 6,
     strokeStyle: "solid",
+    brushType: "pen",
+    brushSmoothing: 0.55,
+    brushTaper: 0,
     opacity: 1,
-    fontFamily: "hand",
+    fontFamily: "Plus Jakarta Sans",
     fontSize: 42,
-    textBgColor: "rgba(17, 24, 39, 0.72)",
+    textBgColor: "rgba(16, 19, 28, 0.8)",
     textShadow: true,
+    eraserMode: "object",
+    eraserSize: 28,
   });
 
-  // Live draft element (when drawing a new stroke/shape)
   const [draftElement, setDraftElement] = useState<BoardElement | null>(null);
-  // Remote live drafts from collaborators
-  const [remoteDrafts, setRemoteDrafts] = useState<Record<string, BoardElement>>({});
-  // Remote collaborator cursors (EDITOR ONLY)
+  const draftElementRef = useRef<BoardElement | null>(null);
+
+  const [remoteDrafts, setRemoteDrafts] = useState<
+    Record<string, { element: BoardElement; receivedAt: number }>
+  >({});
   const [remoteCursors, setRemoteCursors] = useState<
     Record<string, CollaboratorCursor>
   >({});
 
-  // Undo / Redo stacks
   const [undoStack, setUndoStack] = useState<BoardElement[][]>([]);
   const [redoStack, setRedoStack] = useState<BoardElement[][]>([]);
 
-  // Viewport transform
+  // Smooth Camera / Zoom State
   const viewportRef = useRef<HTMLDivElement | null>(null);
-  const [zoom, setZoom] = useState(0.55);
-  const [pan, setPan] = useState({ x: 80, y: 70 });
+  const [camera, setCamera] = useState({ zoom: 0.55, x: 80, y: 70 });
+  const cameraRef = useRef(camera);
+  cameraRef.current = camera;
+  const targetCameraRef = useRef(camera);
+  const cameraRafRef = useRef<number | null>(null);
 
   const interactionRef = useRef<InteractionState>({ kind: "none" });
   const realtimeRef = useRef<RealtimeConnection | null>(null);
+  const syncQueueRef = useRef<BoardSyncQueue | null>(null);
   const elementsRef = useRef<BoardElement[]>(elements);
   elementsRef.current = elements;
+  const selectedIdsRef = useRef<string[]>(selectedIds);
+  selectedIdsRef.current = selectedIds;
 
   const lastCursorSentRef = useRef(0);
   const lastLiveBroadcastRef = useRef(0);
+  const liveStrokeSeqRef = useRef(0);
+  const finalizedDraftsRef = useRef<Map<string, number>>(new Map());
+  const remoteStrokeSeqRef = useRef<Map<string, number>>(new Map());
   const patchDebounceRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
     new Map()
   );
+  const lastHashRef = useRef("");
 
-  // Fit 1920x1080 OBS guide frame cleanly inside viewport with toolbar clearance
-  const fitStageToViewport = useCallback(() => {
-    const el = viewportRef.current;
-    if (!el) return;
-    const rect = el.getBoundingClientRect();
-    if (rect.width < 120 || rect.height < 120) return;
-    const padX = 56;
-    const topReserve = 104; // clearance for floating toolbar + OBS guide badge
-    const padBottom = 52;
-    const availW = Math.max(100, rect.width - padX);
-    const availH = Math.max(100, rect.height - topReserve - padBottom);
-    const scaleX = availW / STAGE_WIDTH;
-    const scaleY = availH / STAGE_HEIGHT;
-    const nextZoom = Math.max(0.15, Math.min(1.15, Math.min(scaleX, scaleY)));
-    const nextPanX = (rect.width - STAGE_WIDTH * nextZoom) / 2;
-    const nextPanY = topReserve + (availH - STAGE_HEIGHT * nextZoom) / 2;
-    setZoom(nextZoom);
-    setPan({ x: nextPanX, y: nextPanY });
+  // Show onboarding tutorial once on first run
+  useEffect(() => {
+    try {
+      if (!localStorage.getItem(TUTORIAL_SEEN_KEY)) {
+        const timer = setTimeout(() => setTutorialOpen(true), 450);
+        return () => clearTimeout(timer);
+      }
+    } catch {
+      // ignore
+    }
   }, []);
 
-  // Auto-collapse sidebars on narrow screens so the 16:9 stage always fits
+  const closeTutorial = useCallback(() => {
+    setTutorialOpen(false);
+    try {
+      localStorage.setItem(TUTORIAL_SEEN_KEY, "1");
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // Load any custom font assets present in the shared library
+  const customFonts = useMemo(
+    () => assets.filter((a) => a.kind === "font"),
+    [assets]
+  );
+  useEffect(() => {
+    for (const f of customFonts) {
+      const fam = f.metadata?.fontFamily || f.name;
+      void ensureCustomFontLoaded(fam, f.url);
+    }
+  }, [customFonts]);
+
+  // Smooth camera interpolation loop
+  const animateCameraTo = useCallback(
+    (next: { zoom: number; x: number; y: number }, immediate = false) => {
+      targetCameraRef.current = next;
+      if (immediate) {
+        if (cameraRafRef.current !== null) {
+          cancelAnimationFrame(cameraRafRef.current);
+          cameraRafRef.current = null;
+        }
+        setCamera(next);
+        return;
+      }
+
+      if (cameraRafRef.current !== null) return;
+
+      const step = () => {
+        const cur = cameraRef.current;
+        const tgt = targetCameraRef.current;
+        const dz = tgt.zoom - cur.zoom;
+        const dx = tgt.x - cur.x;
+        const dy = tgt.y - cur.y;
+
+        if (
+          Math.abs(dz) < 0.0008 &&
+          Math.abs(dx) < 0.3 &&
+          Math.abs(dy) < 0.3
+        ) {
+          cameraRafRef.current = null;
+          setCamera(tgt);
+          return;
+        }
+
+        const ease = 0.28;
+        setCamera({
+          zoom: cur.zoom + dz * ease,
+          x: cur.x + dx * ease,
+          y: cur.y + dy * ease,
+        });
+        cameraRafRef.current = requestAnimationFrame(step);
+      };
+
+      cameraRafRef.current = requestAnimationFrame(step);
+    },
+    []
+  );
+
+  useEffect(() => {
+    return () => {
+      if (cameraRafRef.current !== null) {
+        cancelAnimationFrame(cameraRafRef.current);
+      }
+    };
+  }, []);
+
+  // Fit 1920x1080 OBS guide frame cleanly inside viewport
+  const fitStageToViewport = useCallback(
+    (immediate = false) => {
+      const el = viewportRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 120 || rect.height < 120) return;
+      const padX = 56;
+      const topReserve = 104;
+      const padBottom = 52;
+      const availW = Math.max(100, rect.width - padX);
+      const availH = Math.max(100, rect.height - topReserve - padBottom);
+      const scaleX = availW / STAGE_WIDTH;
+      const scaleY = availH / STAGE_HEIGHT;
+      const nextZoom = Math.max(0.15, Math.min(1.15, Math.min(scaleX, scaleY)));
+      const nextPanX = (rect.width - STAGE_WIDTH * nextZoom) / 2;
+      const nextPanY = topReserve + (availH - STAGE_HEIGHT * nextZoom) / 2;
+      animateCameraTo({ zoom: nextZoom, x: nextPanX, y: nextPanY }, immediate);
+    },
+    [animateCameraTo]
+  );
+
   useEffect(() => {
     if (typeof window !== "undefined" && window.innerWidth < 1100) {
-      setShowMediaPanel(false);
+      setShowLeftPanel(false);
       setShowRightPanel(false);
     }
   }, []);
@@ -206,142 +405,354 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
   useEffect(() => {
     const el = viewportRef.current;
     if (!el) return;
-    fitStageToViewport();
+    fitStageToViewport(true);
     const ro = new ResizeObserver(() => {
-      fitStageToViewport();
+      fitStageToViewport(false);
     });
     ro.observe(el);
     return () => ro.disconnect();
-  }, [fitStageToViewport, showMediaPanel, showRightPanel]);
+  }, [fitStageToViewport, showLeftPanel, showRightPanel]);
 
-  const screenToStage = useCallback(
-    (clientX: number, clientY: number) => {
+  const screenToStage = useCallback((clientX: number, clientY: number) => {
+    const rect = viewportRef.current?.getBoundingClientRect();
+    if (!rect) return { x: 0, y: 0 };
+    const cam = cameraRef.current;
+    return {
+      x: (clientX - rect.left - cam.x) / cam.zoom,
+      y: (clientY - rect.top - cam.y) / cam.zoom,
+    };
+  }, []);
+
+  const zoomAtPoint = useCallback(
+    (factor: number, clientX?: number, clientY?: number) => {
       const rect = viewportRef.current?.getBoundingClientRect();
-      if (!rect) return { x: 0, y: 0 };
-      return {
-        x: (clientX - rect.left - pan.x) / zoom,
-        y: (clientY - rect.top - pan.y) / zoom,
-      };
+      if (!rect) return;
+      const tgt = targetCameraRef.current;
+      const nextZoom = Math.max(0.15, Math.min(3.5, tgt.zoom * factor));
+      const anchorX =
+        clientX !== undefined ? clientX - rect.left : rect.width / 2;
+      const anchorY =
+        clientY !== undefined ? clientY - rect.top : rect.height / 2;
+      const stageX = (anchorX - tgt.x) / tgt.zoom;
+      const stageY = (anchorY - tgt.y) / tgt.zoom;
+      animateCameraTo({
+        zoom: nextZoom,
+        x: anchorX - stageX * nextZoom,
+        y: anchorY - stageY * nextZoom,
+      });
     },
-    [pan.x, pan.y, zoom]
+    [animateCameraTo]
   );
 
-  // Push snapshot for Undo
+  // Native non-passive wheel listener for smooth cursor-centered zoom
+  useEffect(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      if (Math.abs(e.deltaY) < 1 && Math.abs(e.deltaX) < 1) return;
+      const delta = Math.max(-120, Math.min(120, e.deltaY));
+      const factor = Math.pow(1.0018, -delta);
+      zoomAtPoint(factor, e.clientX, e.clientY);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [zoomAtPoint]);
+
   const pushUndoSnapshot = useCallback((snapshot?: BoardElement[]) => {
     const snap = snapshot ?? elementsRef.current;
     setUndoStack((prev) => [...prev.slice(-39), snap]);
     setRedoStack([]);
   }, []);
 
-  // API persistence helpers
-  const postElementAction = useCallback(
-    async (payload: Record<string, unknown>) => {
+  // Refresh shared library on library:updated realtime event
+  const refreshSharedLibrary = useCallback(async () => {
+    try {
+      const res = await fetch(
+        `/api/media?boardId=${encodeURIComponent(initialBoard.id)}`,
+        { cache: "no-store" }
+      );
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        assets?: MediaAsset[];
+        folders?: MediaFolder[];
+      };
+      if (data.assets) setAssets(data.assets);
+      if (data.folders) setFolders(data.folders);
+    } catch {
+      // ignore
+    }
+  }, [initialBoard.id]);
+
+  // Lightweight reconciliation + permission check
+  const resyncBoardSnapshot = useCallback(
+    async (force = false) => {
       try {
+        const hashParam =
+          !force && lastHashRef.current
+            ? `?hash=${encodeURIComponent(lastHashRef.current)}`
+            : "";
         const res = await fetch(
-          `/api/boards/${encodeURIComponent(initialBoard.id)}/elements`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-          }
+          `/api/boards/${encodeURIComponent(initialBoard.id)}${hashParam}`,
+          { cache: "no-store" }
         );
-        if (!res.ok) {
-          const data = (await res.json().catch(() => ({}))) as {
-            error?: string;
-          };
-          setSaveError(
-            data.error || `Error guardando cambios (HTTP ${res.status})`
-          );
-        } else {
-          setSaveError(null);
+        if (res.status === 404 || res.status === 403) {
+          setKickedOut(true);
+          return;
+        }
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          unchanged?: boolean;
+          hash?: string;
+          myRole?: BoardRole;
+          myPaused?: boolean;
+          members?: typeof members;
+          board?: BoardDetail;
+        };
+        if (data.hash) lastHashRef.current = data.hash;
+        if (data.myRole) setMyRole(data.myRole);
+        if (typeof data.myPaused === "boolean") setMyPaused(data.myPaused);
+        if (data.members) setMembers(data.members);
+        if (!data.unchanged && data.board) {
+          setElements(data.board.elements);
+          setMembers(data.board.members);
+          setMyRole(data.board.myRole);
+          setMyPaused(Boolean(data.board.myPaused));
+          setTitle(data.board.title);
+          setRemoteDrafts({});
         }
       } catch {
-        setSaveError(
-          "No se pudieron guardar los últimos cambios (error de red)."
-        );
+        // ignore transient network errors
       }
     },
     [initialBoard.id]
   );
 
+  // Sync Queue setup
+  useEffect(() => {
+    const q = new BoardSyncQueue({
+      boardId: initialBoard.id,
+      onError: setSaveError,
+      onForceResync: () => void resyncBoardSnapshot(true),
+    });
+    syncQueueRef.current = q;
+    return () => {
+      q.dispose();
+      syncQueueRef.current = null;
+    };
+  }, [initialBoard.id, resyncBoardSnapshot]);
+
+  // Cancel any active interaction cleanly (called on blur, pointercancel, or when paused!)
+  const cancelActiveInteraction = useCallback(() => {
+    const inter = interactionRef.current;
+    if (inter.kind === "none") return;
+
+    if (
+      (inter.kind === "draw-freehand" || inter.kind === "draw-shape") &&
+      draftElementRef.current
+    ) {
+      realtimeRef.current?.sendEphemeral({
+        type: "stroke:end",
+        senderId: clientId,
+        elementId: draftElementRef.current.id,
+      });
+    }
+
+    interactionRef.current = { kind: "none" };
+    draftElementRef.current = null;
+    setDraftElement(null);
+    setMarqueeBox(null);
+    setActiveSnapGuides([]);
+    setEraserPreviewIds(new Set());
+  }, [clientId]);
+
+  // Persistence helpers via serialized BoardSyncQueue
   const persistUpsert = useCallback(
-    async (element: BoardElement) => {
+    (element: BoardElement) => {
       realtimeRef.current?.sendPersistedBroadcast({
         type: "element:upsert",
         senderId: clientId,
         element,
       });
-      await postElementAction({
-        action: "upsert",
-        senderId: clientId,
-        element,
+      syncQueueRef.current?.enqueue({
+        kind: "upsert",
+        elementId: element.id,
+        payload: { action: "upsert", senderId: clientId, element },
       });
     },
-    [clientId, postElementAction]
+    [clientId]
+  );
+
+  const persistUpsertMany = useCallback(
+    (els: BoardElement[]) => {
+      if (els.length === 0) return;
+      realtimeRef.current?.sendPersistedBroadcast({
+        type: "elements:upsertMany",
+        senderId: clientId,
+        elements: els,
+      });
+      syncQueueRef.current?.enqueue({
+        kind: "upsertMany",
+        payload: { action: "upsertMany", senderId: clientId, elements: els },
+      });
+    },
+    [clientId]
   );
 
   const persistPatch = useCallback(
-    async (elementId: string, patch: Partial<BoardElement>) => {
+    (elementId: string, patch: Partial<BoardElement>) => {
       realtimeRef.current?.sendPersistedBroadcast({
         type: "element:patch",
         senderId: clientId,
         elementId,
         patch,
       });
-      await postElementAction({
-        action: "patch",
-        senderId: clientId,
+      syncQueueRef.current?.enqueue({
+        kind: "patch",
         elementId,
-        patch,
+        payload: { action: "patch", senderId: clientId, elementId, patch },
       });
     },
-    [clientId, postElementAction]
+    [clientId]
+  );
+
+  const persistBatchPatch = useCallback(
+    (patches: Array<{ elementId: string; patch: Partial<BoardElement> }>) => {
+      if (patches.length === 0) return;
+      realtimeRef.current?.sendPersistedBroadcast({
+        type: "elements:batchPatch",
+        senderId: clientId,
+        patches,
+      });
+      syncQueueRef.current?.enqueue({
+        kind: "batchPatch",
+        payload: { action: "batchPatch", senderId: clientId, patches },
+      });
+    },
+    [clientId]
   );
 
   const persistDelete = useCallback(
-    async (elementIds: string[]) => {
+    (elementIds: string[]) => {
+      if (elementIds.length === 0) return;
       realtimeRef.current?.sendPersistedBroadcast({
         type: "element:delete",
         senderId: clientId,
         elementIds,
       });
-      await postElementAction({
-        action: "delete",
-        senderId: clientId,
+      syncQueueRef.current?.enqueue({
+        kind: "delete",
         elementIds,
+        payload: { action: "delete", senderId: clientId, elementIds },
       });
     },
-    [clientId, postElementAction]
+    [clientId]
   );
 
   const persistReplace = useCallback(
-    async (nextElements: BoardElement[]) => {
+    (nextElements: BoardElement[]) => {
       realtimeRef.current?.sendPersistedBroadcast({
         type: "elements:replace",
         senderId: clientId,
         elements: nextElements,
       });
-      await postElementAction({
-        action: "replace",
-        senderId: clientId,
-        elements: nextElements,
+      syncQueueRef.current?.enqueue({
+        kind: "replace",
+        payload: {
+          action: "replace",
+          senderId: clientId,
+          elements: nextElements,
+        },
       });
     },
-    [clientId, postElementAction]
+    [clientId]
   );
+
+  const broadcastMemberUpdated = useCallback(
+    (member: BoardMember) => {
+      realtimeRef.current?.sendPersistedBroadcast({
+        type: "member:updated",
+        senderId: clientId,
+        member,
+      });
+    },
+    [clientId]
+  );
+
+  const broadcastMemberKicked = useCallback(
+    (payload: {
+      memberId: string;
+      userId?: string;
+      email: string;
+      deletedElementIds?: string[];
+    }) => {
+      realtimeRef.current?.sendPersistedBroadcast({
+        type: "member:kicked",
+        senderId: clientId,
+        ...payload,
+      });
+      if (payload.deletedElementIds?.length) {
+        realtimeRef.current?.sendPersistedBroadcast({
+          type: "element:delete",
+          senderId: clientId,
+          elementIds: payload.deletedElementIds,
+        });
+      }
+    },
+    [clientId]
+  );
+
+  const broadcastLibraryUpdated = useCallback(() => {
+    realtimeRef.current?.sendPersistedBroadcast({
+      type: "library:updated",
+      senderId: clientId,
+      boardId: initialBoard.id,
+    });
+  }, [clientId, initialBoard.id]);
 
   // Realtime subscription
   useEffect(() => {
+    const markFinalized = (id: string) => {
+      finalizedDraftsRef.current.set(id, Date.now());
+    };
+    const isRecentlyFinalized = (id: string) => {
+      const ts = finalizedDraftsRef.current.get(id);
+      if (!ts) return false;
+      if (Date.now() - ts > 30000) {
+        finalizedDraftsRef.current.delete(id);
+        return false;
+      }
+      return true;
+    };
+
     const conn = connectBoardRealtime({
       boardId: initialBoard.id,
       clientId,
-      onStatusChange: setConnectionStatus,
+      presenceUser: {
+        clientId,
+        userId: user.id,
+        email: user.email,
+        name: user.name,
+        color: user.avatarColor,
+        role: initialBoard.myRole,
+        paused: Boolean(initialBoard.myPaused),
+        connectedAt: Date.now(),
+      },
+      onStatusChange: (status) => {
+        setConnectionStatus(status);
+        if (status === "connected") {
+          void resyncBoardSnapshot(false);
+        }
+      },
+      onPresenceChange: setOnlineMembers,
       onEvent: (event: RealtimeEvent) => {
         switch (event.type) {
           case "elements:replace":
             setElements(event.elements);
+            setRemoteDrafts({});
             break;
           case "element:upsert":
+            markFinalized(event.element.id);
             setElements((prev) => {
               const exists = prev.some((e) => e.id === event.element.id);
               if (exists) {
@@ -358,6 +769,14 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
               return copy;
             });
             break;
+          case "elements:upsertMany":
+            for (const el of event.elements) markFinalized(el.id);
+            setElements((prev) => {
+              const map = new Map(prev.map((e) => [e.id, e]));
+              for (const el of event.elements) map.set(el.id, el);
+              return Array.from(map.values());
+            });
+            break;
           case "element:patch":
             setElements((prev) =>
               prev.map((e) =>
@@ -365,19 +784,55 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
               )
             );
             break;
-          case "element:delete": {
-            const set = new Set(event.elementIds);
-            setElements((prev) => prev.filter((e) => !set.has(e.id)));
-            setSelectedId((curr) => (curr && set.has(curr) ? null : curr));
+          case "elements:batchPatch": {
+            const pMap = new Map(
+              event.patches.map((p) => [p.elementId, p.patch])
+            );
+            setElements((prev) =>
+              prev.map((e) => {
+                const p = pMap.get(e.id);
+                return p ? { ...e, ...p } : e;
+              })
+            );
             break;
           }
-          case "stroke:live":
+          case "element:delete": {
+            const set = new Set(event.elementIds);
+            for (const id of event.elementIds) markFinalized(id);
+            setElements((prev) => prev.filter((e) => !set.has(e.id)));
+            setSelectedIds((curr) => curr.filter((id) => !set.has(id)));
+            setRemoteDrafts((prev) => {
+              const copy = { ...prev };
+              let changed = false;
+              for (const id of event.elementIds) {
+                if (copy[id]) {
+                  delete copy[id];
+                  changed = true;
+                }
+              }
+              return changed ? copy : prev;
+            });
+            break;
+          }
+          case "stroke:live": {
+            if (isRecentlyFinalized(event.element.id)) return;
+            if (typeof event.seq === "number") {
+              const prevSeq =
+                remoteStrokeSeqRef.current.get(event.element.id) ?? -1;
+              if (event.seq <= prevSeq) return;
+              remoteStrokeSeqRef.current.set(event.element.id, event.seq);
+            }
             setRemoteDrafts((prev) => ({
               ...prev,
-              [event.element.id]: event.element,
+              [event.element.id]: {
+                element: event.element,
+                receivedAt: Date.now(),
+              },
             }));
             break;
+          }
           case "stroke:end":
+            markFinalized(event.elementId);
             setRemoteDrafts((prev) => {
               if (!prev[event.elementId]) return prev;
               const copy = { ...prev };
@@ -425,31 +880,90 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
               return copy;
             });
             break;
+          case "member:updated": {
+            setMembers((prev) => {
+              const exists = prev.some((m) => m.id === event.member.id);
+              return exists
+                ? prev.map((m) => (m.id === event.member.id ? event.member : m))
+                : [...prev, event.member];
+            });
+            const isMe =
+              event.member.userId === user.id ||
+              event.member.email.toLowerCase() === user.email.toLowerCase();
+            if (isMe) {
+              setMyRole(event.member.role);
+              const nextPaused = Boolean(event.member.paused);
+              setMyPaused(nextPaused);
+              if (nextPaused || event.member.role === "viewer") {
+                cancelActiveInteraction();
+                setEditingTextId(null);
+              }
+              realtimeRef.current?.updatePresence({
+                role: event.member.role,
+                paused: nextPaused,
+              });
+            }
+            break;
+          }
+          case "member:kicked": {
+            if (event.deletedElementIds?.length) {
+              const delSet = new Set(event.deletedElementIds);
+              setElements((prev) => prev.filter((e) => !delSet.has(e.id)));
+              setSelectedIds((prev) => prev.filter((id) => !delSet.has(id)));
+            }
+            setMembers((prev) => prev.filter((m) => m.id !== event.memberId));
+            const isMe =
+              event.userId === user.id ||
+              event.email.toLowerCase() === user.email.toLowerCase();
+            if (isMe) {
+              cancelActiveInteraction();
+              setKickedOut(true);
+            }
+            break;
+          }
+          case "library:updated":
+            void refreshSharedLibrary();
+            break;
         }
       },
     });
 
     realtimeRef.current = conn;
 
-    // Prune stale remote cursors every 4s
+    // Prune stale remote cursors and drafts every 2.5s
     const pruneInterval = setInterval(() => {
-      const cutoff = Date.now() - 12000;
+      const cursorCutoff = Date.now() - 12000;
       setRemoteCursors((prev) => {
         let changed = false;
         const next: Record<string, CollaboratorCursor> = {};
         for (const [k, v] of Object.entries(prev)) {
-          if (v.updatedAt >= cutoff) {
-            next[k] = v;
-          } else {
-            changed = true;
-          }
+          if (v.updatedAt >= cursorCutoff) next[k] = v;
+          else changed = true;
         }
         return changed ? next : prev;
       });
-    }, 4000);
+
+      const draftCutoff = Date.now() - 5000;
+      setRemoteDrafts((prev) => {
+        let changed = false;
+        const next: Record<string, { element: BoardElement; receivedAt: number }> =
+          {};
+        for (const [k, v] of Object.entries(prev)) {
+          if (v.receivedAt >= draftCutoff) next[k] = v;
+          else changed = true;
+        }
+        return changed ? next : prev;
+      });
+    }, 2500);
+
+    // Periodic lightweight hash reconciliation every 15s
+    const reconcileTimer = setInterval(() => {
+      void resyncBoardSnapshot(false);
+    }, 15000);
 
     return () => {
       clearInterval(pruneInterval);
+      clearInterval(reconcileTimer);
       conn.sendEphemeral({
         type: "cursor:leave",
         senderId: clientId,
@@ -458,43 +972,84 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       conn.close();
       realtimeRef.current = null;
     };
-  }, [initialBoard.id, clientId]);
+  }, [
+    cancelActiveInteraction,
+    clientId,
+    initialBoard.id,
+    initialBoard.myPaused,
+    initialBoard.myRole,
+    refreshSharedLibrary,
+    resyncBoardSnapshot,
+    user.avatarColor,
+    user.email,
+    user.id,
+    user.name,
+  ]);
 
-  // Mutations
+  // Global window blur safeguard (prevents sticky pointer drags if alt-tabbed)
+  useEffect(() => {
+    const onBlur = () => cancelActiveInteraction();
+    window.addEventListener("blur", onBlur);
+    return () => window.removeEventListener("blur", onBlur);
+  }, [cancelActiveInteraction]);
+
+  // Element Mutations
   const handlePatchElement = useCallback(
     (id: string, patch: Partial<BoardElement>, immediate = true) => {
       if (!canEdit) return;
       setElements((prev) =>
-        prev.map((e) => (e.id === id ? { ...e, ...patch, updatedAt: Date.now() } : e))
+        prev.map((e) =>
+          e.id === id ? { ...e, ...patch, updatedAt: Date.now() } : e
+        )
       );
 
       if (immediate) {
-        void persistPatch(id, patch);
+        persistPatch(id, patch);
       } else {
         const existingTimer = patchDebounceRef.current.get(id);
         if (existingTimer) clearTimeout(existingTimer);
         patchDebounceRef.current.set(
           id,
           setTimeout(() => {
-            void persistPatch(id, patch);
+            persistPatch(id, patch);
             patchDebounceRef.current.delete(id);
-          }, 160)
+          }, 140)
         );
       }
     },
     [canEdit, persistPatch]
   );
 
-  const handleDeleteElement = useCallback(
-    (id: string) => {
-      if (!canEdit) return;
+  const handleBatchPatch = useCallback(
+    (patches: Array<{ elementId: string; patch: Partial<BoardElement> }>) => {
+      if (!canEdit || patches.length === 0) return;
       pushUndoSnapshot();
-      setElements((prev) => prev.filter((e) => e.id !== id));
-      if (selectedId === id) setSelectedId(null);
-      if (editingTextId === id) setEditingTextId(null);
-      void persistDelete([id]);
+      const map = new Map(patches.map((p) => [p.elementId, p.patch]));
+      const now = Date.now();
+      setElements((prev) =>
+        prev.map((el) => {
+          const p = map.get(el.id);
+          return p ? { ...el, ...p, updatedAt: now } : el;
+        })
+      );
+      persistBatchPatch(patches);
     },
-    [canEdit, editingTextId, persistDelete, pushUndoSnapshot, selectedId]
+    [canEdit, persistBatchPatch, pushUndoSnapshot]
+  );
+
+  const handleDeleteElements = useCallback(
+    (ids: string[]) => {
+      if (!canEdit || ids.length === 0) return;
+      pushUndoSnapshot();
+      const delSet = new Set(ids);
+      setElements((prev) => prev.filter((e) => !delSet.has(e.id)));
+      setSelectedIds((prev) => prev.filter((id) => !delSet.has(id)));
+      if (editingTextId && delSet.has(editingTextId)) {
+        setEditingTextId(null);
+      }
+      persistDelete(ids);
+    },
+    [canEdit, editingTextId, persistDelete, pushUndoSnapshot]
   );
 
   const handleDuplicateElement = useCallback(
@@ -506,17 +1061,20 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       const copy: BoardElement = {
         ...orig,
         id: `el_${nanoid(12)}`,
-        name: `${orig.name} (copia)`,
+        name: getNextElementName(orig.type, elementsRef.current),
         x: orig.x + 36,
         y: orig.y + 36,
         zIndex: getNextZIndex(elementsRef.current),
+        createdByUserId: user.id,
+        createdByEmail: user.email,
+        createdByName: user.name,
         updatedAt: Date.now(),
       };
       setElements((prev) => [...prev, copy]);
-      setSelectedId(copy.id);
-      void persistUpsert(copy);
+      setSelectedIds([copy.id]);
+      persistUpsert(copy);
     },
-    [canEdit, persistUpsert, pushUndoSnapshot]
+    [canEdit, persistUpsert, pushUndoSnapshot, user.email, user.id, user.name]
   );
 
   const handleMoveLayer = useCallback(
@@ -540,7 +1098,34 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         updatedAt: Date.now(),
       }));
       setElements(reindexed);
-      void persistReplace(reindexed);
+      persistReplace(reindexed);
+    },
+    [canEdit, persistReplace, pushUndoSnapshot]
+  );
+
+  const handleReorderLayer = useCallback(
+    (draggedId: string, targetId: string) => {
+      if (!canEdit || draggedId === targetId) return;
+      const sortedDesc = [...elementsRef.current].sort(
+        (a, b) => b.zIndex - a.zIndex
+      );
+      const fromIdx = sortedDesc.findIndex((e) => e.id === draggedId);
+      const toIdx = sortedDesc.findIndex((e) => e.id === targetId);
+      if (fromIdx < 0 || toIdx < 0) return;
+
+      pushUndoSnapshot();
+      const [moved] = sortedDesc.splice(fromIdx, 1);
+      sortedDesc.splice(toIdx, 0, moved);
+      const total = sortedDesc.length;
+      const reindexed = sortedDesc
+        .map((el, i) => ({
+          ...el,
+          zIndex: total - i,
+          updatedAt: Date.now(),
+        }))
+        .sort((a, b) => a.zIndex - b.zIndex);
+      setElements(reindexed);
+      persistReplace(reindexed);
     },
     [canEdit, persistReplace, pushUndoSnapshot]
   );
@@ -593,21 +1178,25 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       };
       realtimeRef.current?.sendPersistedBroadcast(evt);
 
-      void postElementAction({
-        action: "triggerVideo",
-        senderId: clientId,
+      syncQueueRef.current?.enqueue({
+        kind: "triggerVideo",
         elementId,
-        triggerId: nextTriggerId,
-        triggeredAt: now,
-        playing: nextPlaying,
-        visible: nextVisible,
-        loop: el.loop,
-        muted: el.muted,
-        volume: el.volume,
-        autoHideOnEnd: el.autoHideOnEnd,
+        payload: {
+          action: "triggerVideo",
+          senderId: clientId,
+          elementId,
+          triggerId: nextTriggerId,
+          triggeredAt: now,
+          playing: nextPlaying,
+          visible: nextVisible,
+          loop: el.loop,
+          muted: el.muted,
+          volume: el.volume,
+          autoHideOnEnd: el.autoHideOnEnd,
+        },
       });
     },
-    [canEdit, clientId, postElementAction]
+    [canEdit, clientId]
   );
 
   const handleInsertAsset = useCallback(
@@ -617,7 +1206,53 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       dropPos?: { x: number; y: number }
     ) => {
       if (!canEdit) return;
+      if (asset.kind === "font") return;
+
       pushUndoSnapshot();
+      const now = Date.now();
+
+      if (asset.kind === "document" && asset.metadata?.documentPages?.length) {
+        const first = asset.metadata.documentPages[0];
+        const ratio = (first.width || 600) / (first.height || 800);
+        const height = Math.min(760, Math.max(360, first.height || 700));
+        const width = Math.round(height * ratio);
+        const x = dropPos
+          ? Math.round(dropPos.x - width / 2)
+          : Math.round((STAGE_WIDTH - width) / 2);
+        const y = dropPos
+          ? Math.round(dropPos.y - height / 2)
+          : Math.round((STAGE_HEIGHT - height) / 2);
+
+        const docEl: BoardElement = {
+          id: `el_${nanoid(12)}`,
+          boardId: initialBoard.id,
+          type: "document",
+          name: getNextElementName("document", elementsRef.current, asset.name),
+          x,
+          y,
+          width,
+          height,
+          rotation: 0,
+          zIndex: getNextZIndex(elementsRef.current),
+          visible: true,
+          locked: false,
+          opacity: 1,
+          documentTitle: asset.name,
+          documentPages: asset.metadata.documentPages,
+          currentPage: 1,
+          mediaAssetId: asset.id,
+          objectFit: "contain",
+          createdByUserId: user.id,
+          createdByEmail: user.email,
+          createdByName: user.name,
+          updatedAt: now,
+        };
+        setElements((prev) => [...prev, docEl]);
+        setSelectedIds([docEl.id]);
+        setTool("select");
+        persistUpsert(docEl);
+        return;
+      }
 
       const maxW = 640;
       const maxH = 420;
@@ -638,12 +1273,14 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         ? Math.round(dropPos.y - height / 2)
         : Math.round((STAGE_HEIGHT - height) / 2);
 
-      const now = Date.now();
+      const type = asset.kind === "video" ? "video" : "image";
+      const effectiveLoop = options.autoHideOnEnd ? false : options.loop;
+
       const newEl: BoardElement = {
         id: `el_${nanoid(12)}`,
         boardId: initialBoard.id,
-        type: asset.kind === "video" ? "video" : "image",
-        name: asset.name,
+        type,
+        name: getNextElementName(type, elementsRef.current, asset.name),
         x,
         y,
         width: Math.round(width),
@@ -657,10 +1294,13 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         mediaAssetId: asset.id,
         aspectRatio: ratio,
         objectFit: "contain",
+        createdByUserId: user.id,
+        createdByEmail: user.email,
+        createdByName: user.name,
         ...(asset.kind === "video"
           ? {
               playing: true,
-              loop: options.loop,
+              loop: effectiveLoop,
               autoHideOnEnd: options.autoHideOnEnd,
               muted: options.muted,
               volume: 0.85,
@@ -672,11 +1312,160 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       };
 
       setElements((prev) => [...prev, newEl]);
-      setSelectedId(newEl.id);
+      setSelectedIds([newEl.id]);
       setTool("select");
-      void persistUpsert(newEl);
+      persistUpsert(newEl);
     },
-    [canEdit, initialBoard.id, persistUpsert, pushUndoSnapshot]
+    [
+      canEdit,
+      initialBoard.id,
+      persistUpsert,
+      pushUndoSnapshot,
+      user.email,
+      user.id,
+      user.name,
+    ]
+  );
+
+  const handleDocumentInserted = useCallback(
+    (
+      mode: "single" | "separate",
+      docTitle: string,
+      pages: DocumentPage[],
+      asset?: MediaAsset
+    ) => {
+      if (!canEdit || pages.length === 0) return;
+      if (asset) {
+        setAssets((prev) => [
+          asset,
+          ...prev.filter((a) => a.id !== asset.id),
+        ]);
+        broadcastLibraryUpdated();
+      }
+
+      pushUndoSnapshot();
+      const now = Date.now();
+      let nextZ = getNextZIndex(elementsRef.current);
+
+      if (mode === "single") {
+        const first = pages[0];
+        const ratio = (first.width || 600) / (first.height || 800);
+        const height = Math.min(780, Math.max(400, first.height || 720));
+        const width = Math.round(height * ratio);
+        const el: BoardElement = {
+          id: `el_${nanoid(12)}`,
+          boardId: initialBoard.id,
+          type: "document",
+          name: getNextElementName("document", elementsRef.current, docTitle),
+          x: Math.round((STAGE_WIDTH - width) / 2),
+          y: Math.round((STAGE_HEIGHT - height) / 2),
+          width,
+          height,
+          rotation: 0,
+          zIndex: nextZ,
+          visible: true,
+          locked: false,
+          opacity: 1,
+          documentTitle: docTitle,
+          documentPages: pages,
+          currentPage: 1,
+          mediaAssetId: asset?.id,
+          objectFit: "contain",
+          createdByUserId: user.id,
+          createdByEmail: user.email,
+          createdByName: user.name,
+          updatedAt: now,
+        };
+        setElements((prev) => [...prev, el]);
+        setSelectedIds([el.id]);
+        setTool("select");
+        persistUpsert(el);
+        return;
+      }
+
+      const created: BoardElement[] = [];
+      let currentEls = [...elementsRef.current];
+      pages.forEach((pg, idx) => {
+        const ratio = (pg.width || 600) / (pg.height || 800);
+        const height = 680;
+        const width = Math.round(height * ratio);
+        const offset = idx * 38;
+        const el: BoardElement = {
+          id: `el_${nanoid(12)}`,
+          boardId: initialBoard.id,
+          type: "image",
+          name: getNextElementName(
+            "image",
+            currentEls,
+            `${docTitle} Pág ${pg.pageNumber}`
+          ),
+          x: Math.round((STAGE_WIDTH - width) / 2 + offset),
+          y: Math.round((STAGE_HEIGHT - height) / 2 + offset),
+          width,
+          height,
+          rotation: 0,
+          zIndex: nextZ++,
+          visible: true,
+          locked: false,
+          opacity: 1,
+          src: pg.url,
+          aspectRatio: ratio,
+          objectFit: "contain",
+          createdByUserId: user.id,
+          createdByEmail: user.email,
+          createdByName: user.name,
+          updatedAt: now,
+        };
+        created.push(el);
+        currentEls.push(el);
+      });
+
+      setElements((prev) => [...prev, ...created]);
+      setSelectedIds(created.map((c) => c.id));
+      setTool("select");
+      persistUpsertMany(created);
+    },
+    [
+      canEdit,
+      initialBoard.id,
+      persistUpsert,
+      persistUpsertMany,
+      pushUndoSnapshot,
+      user.email,
+      user.id,
+      user.name,
+    ]
+  );
+
+  const handleApplyFontAsset = useCallback(
+    (asset: MediaAsset) => {
+      const fam = asset.metadata?.fontFamily || asset.name;
+      void ensureCustomFontLoaded(fam, asset.url);
+      const selectedTextIds = selectedIdsRef.current.filter((id) => {
+        const el = elementsRef.current.find((item) => item.id === id);
+        return el?.type === "text";
+      });
+      if (selectedTextIds.length > 0 && canEdit) {
+        handleBatchPatch(
+          selectedTextIds.map((id) => ({
+            elementId: id,
+            patch: {
+              fontFamily: fam,
+              customFontName: fam,
+              customFontUrl: asset.url,
+            },
+          }))
+        );
+      } else {
+        setDrawDefaults((prev) => ({
+          ...prev,
+          fontFamily: fam,
+          customFontName: fam,
+          customFontUrl: asset.url,
+        }));
+      }
+    },
+    [canEdit, handleBatchPatch]
   );
 
   const handleHideAllVideos = useCallback(() => {
@@ -688,7 +1477,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         : e
     );
     setElements(next);
-    void persistReplace(next);
+    persistReplace(next);
   }, [canEdit, persistReplace, pushUndoSnapshot]);
 
   const handleShowAllLayers = useCallback(() => {
@@ -700,8 +1489,83 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       updatedAt: Date.now(),
     }));
     setElements(next);
-    void persistReplace(next);
+    persistReplace(next);
   }, [canEdit, persistReplace, pushUndoSnapshot]);
+
+  const handleAuthorVisibility = useCallback(
+    (target: { userId?: string; email?: string }, visible: boolean) => {
+      if (myRole !== "owner") return;
+      const now = Date.now();
+      const patches: Array<{ elementId: string; patch: Partial<BoardElement> }> =
+        [];
+      setElements((prev) =>
+        prev.map((el) => {
+          const match =
+            (target.userId && el.createdByUserId === target.userId) ||
+            (target.email &&
+              el.createdByEmail?.toLowerCase() === target.email.toLowerCase());
+          if (!match) return el;
+          patches.push({ elementId: el.id, patch: { visible } });
+          return { ...el, visible, updatedAt: now };
+        })
+      );
+      if (patches.length > 0) {
+        realtimeRef.current?.sendPersistedBroadcast({
+          type: "elements:batchPatch",
+          senderId: clientId,
+          patches,
+        });
+      }
+      syncQueueRef.current?.enqueue({
+        kind: "authorVisibility",
+        payload: {
+          action: "authorVisibility",
+          senderId: clientId,
+          userId: target.userId,
+          email: target.email,
+          visible,
+        },
+      });
+    },
+    [clientId, myRole]
+  );
+
+  const handleAuthorDelete = useCallback(
+    (target: { userId?: string; email?: string }) => {
+      if (myRole !== "owner") return;
+      pushUndoSnapshot();
+      const deletedIds: string[] = [];
+      setElements((prev) =>
+        prev.filter((el) => {
+          const match =
+            (target.userId && el.createdByUserId === target.userId) ||
+            (target.email &&
+              el.createdByEmail?.toLowerCase() === target.email.toLowerCase());
+          if (match) deletedIds.push(el.id);
+          return !match;
+        })
+      );
+      if (deletedIds.length > 0) {
+        const delSet = new Set(deletedIds);
+        setSelectedIds((prev) => prev.filter((id) => !delSet.has(id)));
+        realtimeRef.current?.sendPersistedBroadcast({
+          type: "element:delete",
+          senderId: clientId,
+          elementIds: deletedIds,
+        });
+      }
+      syncQueueRef.current?.enqueue({
+        kind: "authorDelete",
+        payload: {
+          action: "authorDelete",
+          senderId: clientId,
+          userId: target.userId,
+          email: target.email,
+        },
+      });
+    },
+    [clientId, myRole, pushUndoSnapshot]
+  );
 
   // Undo / Redo handlers
   const handleUndo = useCallback(() => {
@@ -710,7 +1574,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     setUndoStack((s) => s.slice(0, -1));
     setRedoStack((r) => [...r.slice(-39), elementsRef.current]);
     setElements(prevSnapshot);
-    void persistReplace(prevSnapshot);
+    persistReplace(prevSnapshot);
   }, [canEdit, persistReplace, undoStack]);
 
   const handleRedo = useCallback(() => {
@@ -719,10 +1583,10 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     setRedoStack((r) => r.slice(0, -1));
     setUndoStack((u) => [...u.slice(-39), elementsRef.current]);
     setElements(nextSnapshot);
-    void persistReplace(nextSnapshot);
+    persistReplace(nextSnapshot);
   }, [canEdit, persistReplace, redoStack]);
 
-  // Keyboard shortcuts
+  // Keyboard shortcuts (NO 'H' hand tool!)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -733,6 +1597,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
           target.isContentEditable);
 
       if (e.code === "Space" && !isInput) {
+        e.preventDefault();
         setSpacePressed(true);
         return;
       }
@@ -751,9 +1616,18 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         handleRedo();
         return;
       }
-      if (mod && e.key.toLowerCase() === "d" && selectedId) {
+      if (mod && e.key.toLowerCase() === "a") {
         e.preventDefault();
-        handleDuplicateElement(selectedId);
+        setSelectedIds(elementsRef.current.map((item) => item.id));
+        return;
+      }
+      if (
+        mod &&
+        e.key.toLowerCase() === "d" &&
+        selectedIdsRef.current.length === 1
+      ) {
+        e.preventDefault();
+        handleDuplicateElement(selectedIdsRef.current[0]);
         return;
       }
       if (mod && e.key === "0") {
@@ -764,36 +1638,83 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
 
       if (
         (e.key === "Delete" || e.key === "Backspace") &&
-        selectedId &&
+        selectedIdsRef.current.length > 0 &&
         canEdit
       ) {
         e.preventDefault();
-        handleDeleteElement(selectedId);
+        handleDeleteElements(selectedIdsRef.current);
         return;
       }
 
       if (e.key === "Escape") {
-        setSelectedId(null);
+        cancelActiveInteraction();
+        setSelectedIds([]);
         setEditingTextId(null);
         setTool("select");
         return;
       }
 
-      if (e.shiftKey && e.key.toLowerCase() === "h" && selectedId && canEdit) {
-        const el = elementsRef.current.find((item) => item.id === selectedId);
-        if (el) handlePatchElement(el.id, { visible: !el.visible });
+      if (
+        e.shiftKey &&
+        e.key.toLowerCase() === "h" &&
+        selectedIdsRef.current.length > 0 &&
+        canEdit
+      ) {
+        handleBatchPatch(
+          selectedIdsRef.current.map((id) => {
+            const el = elementsRef.current.find((item) => item.id === id);
+            return { elementId: id, patch: { visible: !(el?.visible ?? true) } };
+          })
+        );
+        return;
+      }
+
+      if (e.key === "Enter" && selectedIdsRef.current.length === 1 && canEdit) {
+        const sel = elementsRef.current.find(
+          (item) => item.id === selectedIdsRef.current[0]
+        );
+        if (sel && sel.type === "text" && !sel.locked) {
+          e.preventDefault();
+          setEditingTextId(sel.id);
+          return;
+        }
+      }
+
+      if (
+        (e.key === "ArrowUp" ||
+          e.key === "ArrowDown" ||
+          e.key === "ArrowLeft" ||
+          e.key === "ArrowRight") &&
+        selectedIdsRef.current.length > 0 &&
+        canEdit
+      ) {
+        e.preventDefault();
+        const step = e.shiftKey ? 10 : 1;
+        const dx = e.key === "ArrowLeft" ? -step : e.key === "ArrowRight" ? step : 0;
+        const dy = e.key === "ArrowUp" ? -step : e.key === "ArrowDown" ? step : 0;
+        const patches = selectedIdsRef.current
+          .map((id) => elementsRef.current.find((item) => item.id === id))
+          .filter((el): el is BoardElement => Boolean(el && !el.locked))
+          .map((el) => ({
+            elementId: el.id,
+            patch: { x: Math.round(el.x + dx), y: Math.round(el.y + dy) },
+          }));
+        if (patches.length > 0) handleBatchPatch(patches);
         return;
       }
 
       const key = e.key.toLowerCase();
       if (key === "v") setTool("select");
-      else if (key === "h") setTool("hand");
+      else if (key === "e" && canEdit) setTool("eraser");
       else if (key === "p" && canEdit) setTool("freehand");
       else if (key === "r" && canEdit) setTool("rectangle");
       else if (key === "o" && canEdit) setTool("ellipse");
       else if (key === "l" && canEdit) setTool("line");
       else if (key === "a" && canEdit) setTool("arrow");
       else if (key === "t" && canEdit) setTool("text");
+      else if (key === "m") setSnapEnabled((v) => !v);
+      else if (key === "g")
+        setGuidesConfig((prev) => ({ ...prev, enabled: !prev.enabled }));
     };
 
     const onKeyUp = (e: KeyboardEvent) => {
@@ -808,19 +1729,19 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     };
   }, [
     canEdit,
+    cancelActiveInteraction,
     fitStageToViewport,
-    handleDeleteElement,
+    handleBatchPatch,
+    handleDeleteElements,
     handleDuplicateElement,
-    handlePatchElement,
     handleRedo,
     handleUndo,
-    selectedId,
   ]);
 
   // Title save
   const handleTitleSave = async () => {
     setEditingTitle(false);
-    const clean = title.trim() || "Tablero OBS";
+    const clean = title.trim() || "Tablero OBoardS";
     setTitle(clean);
     realtimeRef.current?.sendPersistedBroadcast({
       type: "board:meta",
@@ -845,7 +1766,6 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     }
   };
 
-  // Copy OBS URL
   const copyObsUrl = async () => {
     const url = `${window.location.origin}/obs/${initialBoard.id}?token=${encodeURIComponent(obsToken)}`;
     try {
@@ -857,18 +1777,20 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     }
   };
 
-  // Canvas pointer handlers
+  // Pointer handlers
   const handleStagePointerDown = (e: React.PointerEvent) => {
-    if (e.button === 1 || tool === "hand" || spacePressed) {
+    // Middle click or Space+Click pans canvas
+    if (e.button === 1 || (e.button === 0 && spacePressed)) {
       e.preventDefault();
       interactionRef.current = {
         kind: "pan",
+        pointerId: e.pointerId,
         startClientX: e.clientX,
         startClientY: e.clientY,
-        startPanX: pan.x,
-        startPanY: pan.y,
+        startPanX: cameraRef.current.x,
+        startPanY: cameraRef.current.y,
       };
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      viewportRef.current?.setPointerCapture(e.pointerId);
       return;
     }
 
@@ -876,48 +1798,90 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
 
     const pt = screenToStage(e.clientX, e.clientY);
 
+    // Select tool on empty canvas -> Marquee drag selection
     if (tool === "select") {
-      setSelectedId(null);
       setEditingTextId(null);
+      const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+      const base = additive ? [...selectedIdsRef.current] : [];
+      if (!additive) setSelectedIds([]);
+      setMarqueeBox({ x: pt.x, y: pt.y, width: 0, height: 0 });
+      interactionRef.current = {
+        kind: "marquee",
+        pointerId: e.pointerId,
+        startX: pt.x,
+        startY: pt.y,
+        curX: pt.x,
+        curY: pt.y,
+        additive,
+        baseSelectedIds: base,
+      };
+      viewportRef.current?.setPointerCapture(e.pointerId);
       return;
     }
 
     if (!canEdit) return;
 
+    // Eraser tool
+    if (tool === "eraser") {
+      const hitSet = new Set<string>();
+      const radius = drawDefaults.eraserSize / 2;
+      for (const el of elementsRef.current) {
+        if (!el.locked && doesCircleHitElement(pt.x, pt.y, radius, el)) {
+          hitSet.add(el.id);
+        }
+      }
+      setEraserPreviewIds(new Set(hitSet));
+      interactionRef.current = {
+        kind: "erase",
+        pointerId: e.pointerId,
+        trail: [{ x: pt.x, y: pt.y }],
+        hitIds: hitSet,
+      };
+      viewportRef.current?.setPointerCapture(e.pointerId);
+      return;
+    }
+
+    // Text tool
     if (tool === "text") {
       pushUndoSnapshot();
       const newText: BoardElement = {
         id: `el_${nanoid(12)}`,
         boardId: initialBoard.id,
         type: "text",
-        name: "Texto",
+        name: getNextElementName("text", elementsRef.current),
         x: Math.round(pt.x),
         y: Math.round(pt.y),
-        width: 360,
-        height: 84,
+        width: 380,
+        height: 88,
         rotation: 0,
         zIndex: getNextZIndex(elementsRef.current),
         visible: true,
         locked: false,
         opacity: drawDefaults.opacity,
-        text: "Escribe aquí...",
+        text: "Escribe aquí…",
         fontSize: drawDefaults.fontSize,
         fontFamily: drawDefaults.fontFamily,
+        customFontName: drawDefaults.customFontName,
+        customFontUrl: drawDefaults.customFontUrl,
         fontWeight: "bold",
         textAlign: "left",
         textColor: drawDefaults.strokeColor,
         textBgColor: drawDefaults.textBgColor,
         textShadow: drawDefaults.textShadow,
+        createdByUserId: user.id,
+        createdByEmail: user.email,
+        createdByName: user.name,
         updatedAt: Date.now(),
       };
       setElements((prev) => [...prev, newText]);
-      setSelectedId(newText.id);
+      setSelectedIds([newText.id]);
       setEditingTextId(newText.id);
       setTool("select");
-      void persistUpsert(newText);
+      persistUpsert(newText);
       return;
     }
 
+    // Brush / Freehand tool
     if (tool === "freehand") {
       const id = `el_${nanoid(12)}`;
       const firstPt: StrokePoint = {
@@ -930,7 +1894,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         id,
         boardId: initialBoard.id,
         type: "freehand",
-        name: getElementDefaultName("freehand"),
+        name: getNextElementName("freehand", elementsRef.current),
         x: norm.x,
         y: norm.y,
         width: norm.width,
@@ -945,19 +1909,29 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         opacity: drawDefaults.opacity,
         strokeColor: drawDefaults.strokeColor,
         strokeWidth: drawDefaults.strokeWidth,
+        brushType: drawDefaults.brushType,
+        brushSmoothing: drawDefaults.brushSmoothing,
+        brushTaper: drawDefaults.brushTaper,
+        createdByUserId: user.id,
+        createdByEmail: user.email,
+        createdByName: user.name,
         updatedAt: Date.now(),
       };
+      draftElementRef.current = draft;
       setDraftElement(draft);
-      setSelectedId(null);
+      setSelectedIds([]);
+      liveStrokeSeqRef.current = 0;
       interactionRef.current = {
         kind: "draw-freehand",
+        pointerId: e.pointerId,
         elementId: id,
         rawPoints: [firstPt],
       };
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      viewportRef.current?.setPointerCapture(e.pointerId);
       return;
     }
 
+    // Shape tools
     if (
       tool === "rectangle" ||
       tool === "ellipse" ||
@@ -969,7 +1943,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         id,
         boardId: initialBoard.id,
         type: tool,
-        name: getElementDefaultName(tool),
+        name: getNextElementName(tool, elementsRef.current),
         x: pt.x,
         y: pt.y,
         width: 4,
@@ -986,18 +1960,24 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         strokeWidth: drawDefaults.strokeWidth,
         strokeStyle: drawDefaults.strokeStyle,
         borderRadius: tool === "rectangle" ? 14 : undefined,
+        createdByUserId: user.id,
+        createdByEmail: user.email,
+        createdByName: user.name,
         updatedAt: Date.now(),
       };
+      draftElementRef.current = draft;
       setDraftElement(draft);
-      setSelectedId(null);
+      setSelectedIds([]);
+      liveStrokeSeqRef.current = 0;
       interactionRef.current = {
         kind: "draw-shape",
+        pointerId: e.pointerId,
         elementId: id,
         shapeType: tool,
         startX: pt.x,
         startY: pt.y,
       };
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      viewportRef.current?.setPointerCapture(e.pointerId);
     }
   };
 
@@ -1008,19 +1988,44 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     if (tool !== "select" || spacePressed || e.button !== 0) return;
     if (editingTextId === el.id) return;
     e.stopPropagation();
-    setSelectedId(el.id);
+
+    const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+    let nextSelected: string[];
+
+    if (additive) {
+      if (selectedIdsRef.current.includes(el.id)) {
+        nextSelected = selectedIdsRef.current.filter((id) => id !== el.id);
+      } else {
+        nextSelected = [...selectedIdsRef.current, el.id];
+      }
+      setSelectedIds(nextSelected);
+      setEditingTextId(null);
+      return;
+    }
+
+    if (selectedIdsRef.current.includes(el.id)) {
+      nextSelected = selectedIdsRef.current;
+    } else {
+      nextSelected = [el.id];
+      setSelectedIds(nextSelected);
+    }
     setEditingTextId(null);
 
     if (!canEdit || el.locked) return;
 
     const pt = screenToStage(e.clientX, e.clientY);
+    const itemsToMove = elementsRef.current
+      .filter((item) => nextSelected.includes(item.id) && !item.locked)
+      .map((item) => ({ id: item.id, origX: item.x, origY: item.y }));
+
+    if (itemsToMove.length === 0) return;
+
     interactionRef.current = {
       kind: "move",
-      elementId: el.id,
+      pointerId: e.pointerId,
       startStageX: pt.x,
       startStageY: pt.y,
-      origX: el.x,
-      origY: el.y,
+      items: itemsToMove,
       moved: false,
     };
     viewportRef.current?.setPointerCapture(e.pointerId);
@@ -1031,12 +2036,13 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     el: BoardElement,
     handle: ResizeHandle
   ) => {
-    if (!canEdit || el.locked) return;
+    if (!canEdit || el.locked || e.button !== 0) return;
     e.stopPropagation();
     const pt = screenToStage(e.clientX, e.clientY);
     pushUndoSnapshot();
     interactionRef.current = {
       kind: "resize",
+      pointerId: e.pointerId,
       elementId: el.id,
       handle,
       startStageX: pt.x,
@@ -1051,13 +2057,14 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         x2: el.x2,
         y2: el.y2,
       },
-      keepAspect: el.type === "image" || el.type === "video",
+      keepAspect:
+        el.type === "image" || el.type === "video" || el.type === "document",
     };
     viewportRef.current?.setPointerCapture(e.pointerId);
   };
 
   const handleRotatePointerDown = (e: React.PointerEvent, el: BoardElement) => {
-    if (!canEdit || el.locked) return;
+    if (!canEdit || el.locked || e.button !== 0) return;
     e.stopPropagation();
     const pt = screenToStage(e.clientX, e.clientY);
     const centerX = el.x + el.width / 2;
@@ -1066,6 +2073,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     pushUndoSnapshot();
     interactionRef.current = {
       kind: "rotate",
+      pointerId: e.pointerId,
       elementId: el.id,
       centerX,
       centerY,
@@ -1075,11 +2083,210 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     viewportRef.current?.setPointerCapture(e.pointerId);
   };
 
+  const finishInteraction = useCallback(
+    (pointerId?: number) => {
+      const inter = interactionRef.current;
+      if (inter.kind === "none") return;
+      if (pointerId !== undefined && inter.pointerId !== pointerId) return;
+
+      interactionRef.current = { kind: "none" };
+      setActiveSnapGuides([]);
+
+      try {
+        if (
+          pointerId !== undefined &&
+          viewportRef.current?.hasPointerCapture(pointerId)
+        ) {
+          viewportRef.current.releasePointerCapture(pointerId);
+        }
+      } catch {
+        // ignore
+      }
+
+      if (inter.kind === "marquee") {
+        setMarqueeBox(null);
+        return;
+      }
+
+      if (inter.kind === "move" && inter.moved) {
+        const patches: Array<{ elementId: string; patch: Partial<BoardElement> }> =
+          [];
+        for (const item of inter.items) {
+          const finalEl = elementsRef.current.find((el) => el.id === item.id);
+          if (finalEl) {
+            patches.push({
+              elementId: finalEl.id,
+              patch: { x: finalEl.x, y: finalEl.y },
+            });
+          }
+        }
+        if (patches.length === 1) {
+          persistPatch(patches[0].elementId, patches[0].patch);
+        } else if (patches.length > 1) {
+          persistBatchPatch(patches);
+        }
+        return;
+      }
+
+      if (inter.kind === "resize") {
+        const finalEl = elementsRef.current.find(
+          (e) => e.id === inter.elementId
+        );
+        if (finalEl) {
+          persistPatch(finalEl.id, {
+            x: finalEl.x,
+            y: finalEl.y,
+            width: finalEl.width,
+            height: finalEl.height,
+            x1: finalEl.x1,
+            y1: finalEl.y1,
+            x2: finalEl.x2,
+            y2: finalEl.y2,
+          });
+        }
+        return;
+      }
+
+      if (inter.kind === "rotate") {
+        const finalEl = elementsRef.current.find(
+          (e) => e.id === inter.elementId
+        );
+        if (finalEl) {
+          persistPatch(finalEl.id, { rotation: finalEl.rotation });
+        }
+        return;
+      }
+
+      if (inter.kind === "erase") {
+        setEraserPreviewIds(new Set());
+        const radius = drawDefaults.eraserSize / 2;
+
+        if (drawDefaults.eraserMode === "object") {
+          const toDelete = Array.from(inter.hitIds);
+          if (toDelete.length > 0) {
+            handleDeleteElements(toDelete);
+          }
+          return;
+        }
+
+        // Partial stroke erase mode
+        const toDelete: string[] = [];
+        const fragmentsToCreate: BoardElement[] = [];
+        let workingEls = [...elementsRef.current];
+        let nextZ = getNextZIndex(workingEls);
+
+        for (const el of elementsRef.current) {
+          if (el.locked) continue;
+          if (el.type === "freehand") {
+            const split = splitFreehandStrokeByEraser(el, inter.trail, radius);
+            if (!split.hit) continue;
+            toDelete.push(el.id);
+            for (const run of split.survivingWorldRuns) {
+              const norm = normalizeStrokePoints(run);
+              const frag: BoardElement = {
+                ...el,
+                id: `el_${nanoid(12)}`,
+                name: getNextElementName("freehand", workingEls),
+                x: norm.x,
+                y: norm.y,
+                width: norm.width,
+                height: norm.height,
+                viewBoxWidth: norm.width,
+                viewBoxHeight: norm.height,
+                points: norm.points,
+                rotation: 0,
+                zIndex: nextZ++,
+                updatedAt: Date.now(),
+              };
+              fragmentsToCreate.push(frag);
+              workingEls.push(frag);
+            }
+          } else if (inter.hitIds.has(el.id)) {
+            toDelete.push(el.id);
+          }
+        }
+
+        if (toDelete.length > 0 || fragmentsToCreate.length > 0) {
+          pushUndoSnapshot();
+          const delSet = new Set(toDelete);
+          const nextElements = [
+            ...elementsRef.current.filter((e) => !delSet.has(e.id)),
+            ...fragmentsToCreate,
+          ];
+          setElements(nextElements);
+          setSelectedIds((prev) => prev.filter((id) => !delSet.has(id)));
+          persistReplace(nextElements);
+        }
+        return;
+      }
+
+      if (inter.kind === "draw-freehand" && draftElementRef.current) {
+        const finalEl = draftElementRef.current;
+        draftElementRef.current = null;
+        setDraftElement(null);
+        if ((finalEl.points?.length ?? 0) >= 2) {
+          pushUndoSnapshot();
+          setElements((prev) => [...prev, finalEl]);
+          persistUpsert(finalEl);
+        }
+        realtimeRef.current?.sendEphemeral({
+          type: "stroke:end",
+          senderId: clientId,
+          elementId: finalEl.id,
+        });
+        return;
+      }
+
+      if (inter.kind === "draw-shape" && draftElementRef.current) {
+        const finalEl = draftElementRef.current;
+        draftElementRef.current = null;
+        setDraftElement(null);
+        const isMeaningful =
+          finalEl.type === "line" || finalEl.type === "arrow"
+            ? Math.hypot(
+                (finalEl.x2 ?? 0) - (finalEl.x1 ?? 0),
+                (finalEl.y2 ?? 0) - (finalEl.y1 ?? 0)
+              ) > 8
+            : finalEl.width > 8 || finalEl.height > 8;
+
+        if (isMeaningful) {
+          pushUndoSnapshot();
+          setElements((prev) => [...prev, finalEl]);
+          setSelectedIds([finalEl.id]);
+          setTool("select");
+          persistUpsert(finalEl);
+        }
+        realtimeRef.current?.sendEphemeral({
+          type: "stroke:end",
+          senderId: clientId,
+          elementId: finalEl.id,
+        });
+      }
+    },
+    [
+      clientId,
+      drawDefaults.eraserMode,
+      drawDefaults.eraserSize,
+      handleDeleteElements,
+      persistBatchPatch,
+      persistPatch,
+      persistReplace,
+      persistUpsert,
+      pushUndoSnapshot,
+    ]
+  );
+
   const handleStagePointerMove = (e: React.PointerEvent) => {
     const pt = screenToStage(e.clientX, e.clientY);
     const now = Date.now();
 
-    // Broadcast own collaborator cursor (throttled ~55ms; never sent to OBS)
+    if (tool === "eraser") {
+      setEraserCursorPos(pt);
+    } else if (eraserCursorPos) {
+      setEraserCursorPos(null);
+    }
+
+    // Broadcast collaborator cursor
     if (now - lastCursorSentRef.current > 55) {
       lastCursorSentRef.current = now;
       realtimeRef.current?.sendEphemeral({
@@ -1100,37 +2307,145 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     const inter = interactionRef.current;
     if (inter.kind === "none") return;
 
+    // Safeguard against stuck drags if mouse button was released outside viewport
+    if (e.pointerType === "mouse" && e.buttons === 0) {
+      finishInteraction(inter.pointerId);
+      return;
+    }
+
+    if (inter.pointerId !== e.pointerId) return;
+
     if (inter.kind === "pan") {
-      setPan({
-        x: inter.startPanX + (e.clientX - inter.startClientX),
-        y: inter.startPanY + (e.clientY - inter.startClientY),
-      });
+      animateCameraTo(
+        {
+          zoom: cameraRef.current.zoom,
+          x: inter.startPanX + (e.clientX - inter.startClientX),
+          y: inter.startPanY + (e.clientY - inter.startClientY),
+        },
+        true
+      );
+      return;
+    }
+
+    if (inter.kind === "marquee") {
+      inter.curX = pt.x;
+      inter.curY = pt.y;
+      const left = Math.min(inter.startX, pt.x);
+      const top = Math.min(inter.startY, pt.y);
+      const width = Math.abs(pt.x - inter.startX);
+      const height = Math.abs(pt.y - inter.startY);
+      setMarqueeBox({ x: left, y: top, width, height });
+
+      if (width > 3 || height > 3) {
+        const box = {
+          left,
+          top,
+          right: left + width,
+          bottom: top + height,
+        };
+        const hitIds = elementsRef.current
+          .filter(
+            (el) => !el.locked && doRectsIntersect(box, getElementWorldBounds(el))
+          )
+          .map((el) => el.id);
+        const merged = Array.from(new Set([...inter.baseSelectedIds, ...hitIds]));
+        setSelectedIds(merged);
+      }
+      return;
+    }
+
+    if (inter.kind === "erase") {
+      inter.trail.push({ x: pt.x, y: pt.y });
+      const radius = drawDefaults.eraserSize / 2;
+      let changed = false;
+      for (const el of elementsRef.current) {
+        if (!el.locked && doesCircleHitElement(pt.x, pt.y, radius, el)) {
+          if (!inter.hitIds.has(el.id)) {
+            inter.hitIds.add(el.id);
+            changed = true;
+          }
+        }
+      }
+      if (changed) {
+        setEraserPreviewIds(new Set(inter.hitIds));
+      }
       return;
     }
 
     if (inter.kind === "move") {
-      const dx = pt.x - inter.startStageX;
-      const dy = pt.y - inter.startStageY;
-      if (!inter.moved && (Math.abs(dx) > 2 || Math.abs(dy) > 2)) {
+      const rawDx = pt.x - inter.startStageX;
+      const rawDy = pt.y - inter.startStageY;
+      if (!inter.moved && (Math.abs(rawDx) > 2 || Math.abs(rawDy) > 2)) {
         pushUndoSnapshot();
         inter.moved = true;
       }
       if (!inter.moved) return;
-      const nx = Math.round(inter.origX + dx);
-      const ny = Math.round(inter.origY + dy);
-      setElements((prev) =>
-        prev.map((el) =>
-          el.id === inter.elementId ? { ...el, x: nx, y: ny } : el
-        )
+
+      let finalDx = rawDx;
+      let finalDy = rawDy;
+
+      if (snapEnabled && !e.altKey) {
+        const movingOrig = inter.items
+          .map((item) => {
+            const base = elementsRef.current.find((el) => el.id === item.id);
+            return base ? { ...base, x: item.origX, y: item.origY } : null;
+          })
+          .filter(Boolean) as BoardElement[];
+
+        const snapped = computeMoveSnap({
+          movingElements: movingOrig,
+          allElements: elementsRef.current,
+          deltaX: rawDx,
+          deltaY: rawDy,
+          zoom: cameraRef.current.zoom,
+          includeGuides: guidesConfig.enabled,
+        });
+        finalDx = snapped.dx;
+        finalDy = snapped.dy;
+        setActiveSnapGuides(snapped.guides);
+      } else {
+        setActiveSnapGuides([]);
+      }
+
+      const movedMap = new Map(
+        inter.items.map((item) => [
+          item.id,
+          {
+            x: Math.round(item.origX + finalDx),
+            y: Math.round(item.origY + finalDy),
+          },
+        ])
       );
+
+      setElements((prev) =>
+        prev.map((el) => {
+          const nextPos = movedMap.get(el.id);
+          return nextPos ? { ...el, x: nextPos.x, y: nextPos.y } : el;
+        })
+      );
+
       if (now - lastLiveBroadcastRef.current > 40) {
         lastLiveBroadcastRef.current = now;
-        realtimeRef.current?.sendEphemeral({
-          type: "element:patch",
-          senderId: clientId,
-          elementId: inter.elementId,
-          patch: { x: nx, y: ny },
-        });
+        const patches = Array.from(movedMap.entries()).map(
+          ([elementId, pos]) => ({
+            elementId,
+            patch: { x: pos.x, y: pos.y },
+          })
+        );
+        if (patches.length === 1) {
+          realtimeRef.current?.sendEphemeral({
+            type: "element:patch",
+            senderId: clientId,
+            elementId: patches[0].elementId,
+            patch: patches[0].patch,
+          });
+        } else if (patches.length > 1) {
+          realtimeRef.current?.sendEphemeral({
+            type: "elements:batchPatch",
+            senderId: clientId,
+            patches,
+          });
+        }
       }
       return;
     }
@@ -1156,13 +2471,35 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
 
       const lockAspect =
         (inter.keepAspect || e.shiftKey) &&
-        (handle === "nw" || handle === "ne" || handle === "se" || handle === "sw");
+        (handle === "nw" ||
+          handle === "ne" ||
+          handle === "se" ||
+          handle === "sw");
       if (lockAspect && orig.height > 0) {
         const ratio = orig.width / orig.height;
         height = Math.max(20, width / ratio);
         if (handle.includes("n")) {
           y = orig.y + (orig.height - height);
         }
+      }
+
+      if (snapEnabled && !e.altKey) {
+        const snapped = computeResizeSnap({
+          elementId: inter.elementId,
+          handle,
+          box: { x, y, width, height },
+          allElements: elementsRef.current,
+          zoom: cameraRef.current.zoom,
+          keepAspect: lockAspect,
+          includeGuides: guidesConfig.enabled,
+        });
+        x = snapped.x;
+        y = snapped.y;
+        width = snapped.width;
+        height = snapped.height;
+        setActiveSnapGuides(snapped.guides);
+      } else {
+        setActiveSnapGuides([]);
       }
 
       const patch: Partial<BoardElement> = {
@@ -1181,7 +2518,9 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       }
 
       setElements((prev) =>
-        prev.map((el) => (el.id === inter.elementId ? { ...el, ...patch } : el))
+        prev.map((el) =>
+          el.id === inter.elementId ? { ...el, ...patch } : el
+        )
       );
       if (now - lastLiveBroadcastRef.current > 40) {
         lastLiveBroadcastRef.current = now;
@@ -1200,10 +2539,10 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         pt.y - inter.centerY,
         pt.x - inter.centerX
       );
-      let deg =
-        inter.origRotation + ((currentAngle - inter.startAngle) * 180) / Math.PI;
-      if (e.shiftKey) deg = Math.round(deg / 15) * 15;
-      else deg = Math.round(deg);
+      const rawDeg =
+        inter.origRotation +
+        ((currentAngle - inter.startAngle) * 180) / Math.PI;
+      const deg = computeRotateSnap(rawDeg, snapEnabled && !e.altKey, e.shiftKey);
 
       setElements((prev) =>
         prev.map((el) =>
@@ -1228,187 +2567,95 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       if (distSq < 4) return;
       inter.rawPoints.push({ x: pt.x, y: pt.y, p: e.pressure || 0.5 });
       const norm = normalizeStrokePoints(inter.rawPoints);
-      setDraftElement((prev) => {
-        if (!prev) return null;
-        const updated: BoardElement = {
-          ...prev,
-          x: norm.x,
-          y: norm.y,
-          width: norm.width,
-          height: norm.height,
-          viewBoxWidth: norm.width,
-          viewBoxHeight: norm.height,
-          points: norm.points,
-          updatedAt: now,
-        };
-        if (now - lastLiveBroadcastRef.current > 35) {
-          lastLiveBroadcastRef.current = now;
-          realtimeRef.current?.sendEphemeral({
-            type: "stroke:live",
-            senderId: clientId,
-            element: updated,
-          });
-        }
-        return updated;
-      });
-      return;
-    }
+      const prev = draftElementRef.current;
+      if (!prev) return;
+      const updated: BoardElement = {
+        ...prev,
+        x: norm.x,
+        y: norm.y,
+        width: norm.width,
+        height: norm.height,
+        viewBoxWidth: norm.width,
+        viewBoxHeight: norm.height,
+        points: norm.points,
+        updatedAt: now,
+      };
+      draftElementRef.current = updated;
+      setDraftElement(updated);
 
-    if (inter.kind === "draw-shape") {
-      const { startX, startY, shapeType } = inter;
-      setDraftElement((prev) => {
-        if (!prev) return null;
-        let updated: BoardElement;
-        if (shapeType === "line" || shapeType === "arrow") {
-          const minX = Math.min(startX, pt.x);
-          const minY = Math.min(startY, pt.y);
-          const w = Math.max(4, Math.abs(pt.x - startX));
-          const h = Math.max(4, Math.abs(pt.y - startY));
-          updated = {
-            ...prev,
-            x: Math.round(minX),
-            y: Math.round(minY),
-            width: Math.round(w),
-            height: Math.round(h),
-            x1: Math.round(startX - minX),
-            y1: Math.round(startY - minY),
-            x2: Math.round(pt.x - minX),
-            y2: Math.round(pt.y - minY),
-            updatedAt: now,
-          };
-        } else {
-          let w = Math.abs(pt.x - startX);
-          let h = Math.abs(pt.y - startY);
-          if (e.shiftKey) {
-            const side = Math.max(w, h);
-            w = side;
-            h = side;
-          }
-          const x = pt.x < startX ? startX - w : startX;
-          const y = pt.y < startY ? startY - h : startY;
-          updated = {
-            ...prev,
-            x: Math.round(x),
-            y: Math.round(y),
-            width: Math.max(4, Math.round(w)),
-            height: Math.max(4, Math.round(h)),
-            updatedAt: now,
-          };
-        }
-        if (now - lastLiveBroadcastRef.current > 40) {
-          lastLiveBroadcastRef.current = now;
-          realtimeRef.current?.sendEphemeral({
-            type: "stroke:live",
-            senderId: clientId,
-            element: updated,
-          });
-        }
-        return updated;
-      });
-    }
-  };
-
-  const handleStagePointerUp = () => {
-    const inter = interactionRef.current;
-    interactionRef.current = { kind: "none" };
-
-    if (inter.kind === "move" && inter.moved) {
-      const finalEl = elementsRef.current.find((e) => e.id === inter.elementId);
-      if (finalEl) {
-        void persistPatch(finalEl.id, { x: finalEl.x, y: finalEl.y });
-      }
-      return;
-    }
-
-    if (inter.kind === "resize") {
-      const finalEl = elementsRef.current.find((e) => e.id === inter.elementId);
-      if (finalEl) {
-        void persistPatch(finalEl.id, {
-          x: finalEl.x,
-          y: finalEl.y,
-          width: finalEl.width,
-          height: finalEl.height,
-          x1: finalEl.x1,
-          y1: finalEl.y1,
-          x2: finalEl.x2,
-          y2: finalEl.y2,
+      if (now - lastLiveBroadcastRef.current > 35) {
+        lastLiveBroadcastRef.current = now;
+        liveStrokeSeqRef.current += 1;
+        realtimeRef.current?.sendEphemeral({
+          type: "stroke:live",
+          senderId: clientId,
+          seq: liveStrokeSeqRef.current,
+          element: updated,
         });
       }
       return;
     }
 
-    if (inter.kind === "rotate") {
-      const finalEl = elementsRef.current.find((e) => e.id === inter.elementId);
-      if (finalEl) {
-        void persistPatch(finalEl.id, { rotation: finalEl.rotation });
-      }
-      return;
-    }
+    if (inter.kind === "draw-shape") {
+      const { startX, startY, shapeType } = inter;
+      const prev = draftElementRef.current;
+      if (!prev) return;
+      let updated: BoardElement;
 
-    if (inter.kind === "draw-freehand" && draftElement) {
-      const finalEl = draftElement;
-      setDraftElement(null);
-      if ((finalEl.points?.length ?? 0) >= 2) {
-        pushUndoSnapshot();
-        setElements((prev) => [...prev, finalEl]);
-        void persistUpsert(finalEl);
+      if (shapeType === "line" || shapeType === "arrow") {
+        const minX = Math.min(startX, pt.x);
+        const minY = Math.min(startY, pt.y);
+        const w = Math.max(4, Math.abs(pt.x - startX));
+        const h = Math.max(4, Math.abs(pt.y - startY));
+        updated = {
+          ...prev,
+          x: Math.round(minX),
+          y: Math.round(minY),
+          width: Math.round(w),
+          height: Math.round(h),
+          x1: Math.round(startX - minX),
+          y1: Math.round(startY - minY),
+          x2: Math.round(pt.x - minX),
+          y2: Math.round(pt.y - minY),
+          updatedAt: now,
+        };
+      } else {
+        let w = Math.abs(pt.x - startX);
+        let h = Math.abs(pt.y - startY);
+        if (e.shiftKey) {
+          const side = Math.max(w, h);
+          w = side;
+          h = side;
+        }
+        const x = pt.x < startX ? startX - w : startX;
+        const y = pt.y < startY ? startY - h : startY;
+        updated = {
+          ...prev,
+          x: Math.round(x),
+          y: Math.round(y),
+          width: Math.max(4, Math.round(w)),
+          height: Math.max(4, Math.round(h)),
+          updatedAt: now,
+        };
       }
-      realtimeRef.current?.sendEphemeral({
-        type: "stroke:end",
-        senderId: clientId,
-        elementId: finalEl.id,
-      });
-      return;
-    }
 
-    if (inter.kind === "draw-shape" && draftElement) {
-      const finalEl = draftElement;
-      setDraftElement(null);
-      const isMeaningful =
-        finalEl.type === "line" || finalEl.type === "arrow"
-          ? Math.hypot(
-              (finalEl.x2 ?? 0) - (finalEl.x1 ?? 0),
-              (finalEl.y2 ?? 0) - (finalEl.y1 ?? 0)
-            ) > 8
-          : finalEl.width > 8 || finalEl.height > 8;
+      draftElementRef.current = updated;
+      setDraftElement(updated);
 
-      if (isMeaningful) {
-        pushUndoSnapshot();
-        setElements((prev) => [...prev, finalEl]);
-        setSelectedId(finalEl.id);
-        setTool("select");
-        void persistUpsert(finalEl);
+      if (now - lastLiveBroadcastRef.current > 40) {
+        lastLiveBroadcastRef.current = now;
+        liveStrokeSeqRef.current += 1;
+        realtimeRef.current?.sendEphemeral({
+          type: "stroke:live",
+          senderId: clientId,
+          seq: liveStrokeSeqRef.current,
+          element: updated,
+        });
       }
-      realtimeRef.current?.sendEphemeral({
-        type: "stroke:end",
-        senderId: clientId,
-        elementId: finalEl.id,
-      });
     }
   };
 
-  // Mouse wheel zoom centered on cursor
-  const handleWheel = (e: React.WheelEvent) => {
-    e.preventDefault();
-    const rect = viewportRef.current?.getBoundingClientRect();
-    if (!rect) return;
-
-    if (e.ctrlKey || e.metaKey || Math.abs(e.deltaY) >= 4) {
-      const factor = e.deltaY < 0 ? 1.09 : 0.92;
-      const nextZoom = Math.max(0.15, Math.min(3.5, zoom * factor));
-      const mouseX = e.clientX - rect.left;
-      const mouseY = e.clientY - rect.top;
-      const stageX = (mouseX - pan.x) / zoom;
-      const stageY = (mouseY - pan.y) / zoom;
-      setZoom(nextZoom);
-      setPan({
-        x: mouseX - stageX * nextZoom,
-        y: mouseY - stageY * nextZoom,
-      });
-    }
-  };
-
-  // Drop media asset or raw file onto canvas
+  // Drop media asset, document, font, or external file onto canvas
   const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     if (!canEdit) return;
@@ -1431,22 +2678,49 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     const files = e.dataTransfer.files;
     if (files && files.length > 0) {
       for (const file of Array.from(files)) {
-        const res = await uploadMediaFile(file);
+        const lower = file.name.toLowerCase();
+        if (
+          lower.endsWith(".pdf") ||
+          lower.endsWith(".txt") ||
+          lower.endsWith(".md") ||
+          file.type === "application/pdf"
+        ) {
+          setPendingDocFile(file);
+          setDocModalOpen(true);
+          continue;
+        }
+
+        const res = await uploadMediaFile(file, { boardId: initialBoard.id });
         if (res.error) {
           setSaveError(res.error);
         } else if (res.asset) {
           setAssets((prev) => [res.asset!, ...prev]);
-          handleInsertAsset(
-            res.asset,
-            { loop: false, autoHideOnEnd: true, muted: false },
-            dropPos
-          );
+          if (res.asset.kind === "font") {
+            handleApplyFontAsset(res.asset);
+          } else {
+            handleInsertAsset(
+              res.asset,
+              { loop: false, autoHideOnEnd: true, muted: false },
+              dropPos
+            );
+          }
         }
       }
     }
   };
 
-  const selectedElement = elements.find((e) => e.id === selectedId) ?? null;
+  const selectedElements = useMemo(() => {
+    const set = new Set(selectedIds);
+    return elements.filter((e) => set.has(e.id));
+  }, [elements, selectedIds]);
+
+  const singleSelected =
+    selectedElements.length === 1 ? selectedElements[0] : null;
+  const multiBounds = useMemo(
+    () =>
+      selectedElements.length > 1 ? getGroupBounds(selectedElements) : null,
+    [selectedElements]
+  );
 
   const backdropClass =
     backdrop === "checker-dark"
@@ -1457,9 +2731,10 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
           ? "bg-black"
           : "bg-emerald-600";
 
-  const cursorStyle =
-    spacePressed || tool === "hand"
-      ? "grab"
+  const cursorStyle = spacePressed
+    ? "grab"
+    : tool === "eraser"
+      ? "none"
       : tool === "select"
         ? "default"
         : tool === "text"
@@ -1467,30 +2742,61 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
           : "crosshair";
 
   return (
-    <div className="h-screen w-screen bg-studio-950 text-zinc-100 flex flex-col overflow-hidden">
+    <div className="h-screen w-screen bg-studio-950 text-zinc-100 flex flex-col overflow-hidden relative">
+      {/* Kicked Out Overlay */}
+      {kickedOut && (
+        <div className="fixed inset-0 z-[200] bg-studio-950/95 backdrop-blur-md flex items-center justify-center p-6">
+          <div className="max-w-md w-full rounded-2xl bg-studio-900 border border-rose-500/35 p-6 text-center space-y-4 shadow-2xl">
+            <div className="w-12 h-12 rounded-2xl bg-rose-500/15 border border-rose-500/30 flex items-center justify-center mx-auto text-rose-400">
+              <ShieldAlert className="w-6 h-6" />
+            </div>
+            <div className="space-y-1">
+              <h2 className="text-base font-semibold text-white">
+                Acceso revocado
+              </h2>
+              <p className="text-xs text-zinc-400 leading-relaxed">
+                El creador del tablero te ha retirado el acceso a este espacio.
+              </p>
+            </div>
+            <Link
+              href="/"
+              className="inline-block px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold transition-colors"
+            >
+              Volver a mis tableros
+            </Link>
+          </div>
+        </div>
+      )}
+
       {/* Studio Top Bar */}
-      <header className="h-13 shrink-0 border-b border-studio-800 bg-studio-900/95 px-3 py-2 flex items-center justify-between gap-3 z-30">
-        <div className="flex items-center gap-2.5 min-w-0">
+      <header className="h-14 shrink-0 border-b border-white/[0.07] bg-studio-900/95 px-3 py-2 flex items-center justify-between gap-3 z-30">
+        <div className="flex items-center gap-2 min-w-0">
           <Link
             href="/"
             title="Volver a mis tableros"
-            className="p-2 rounded-xl bg-studio-850 hover:bg-studio-800 border border-studio-700 text-zinc-300 hover:text-white transition shrink-0"
+            aria-label="Volver a mis tableros"
+            className="p-2 rounded-xl bg-studio-850 hover:bg-studio-800 border border-white/[0.08] text-zinc-300 hover:text-white transition-colors shrink-0"
           >
             <ArrowLeft className="w-4 h-4" />
           </Link>
 
           <button
             type="button"
-            onClick={() => setShowMediaPanel((v) => !v)}
-            title="Mostrar/ocultar biblioteca de clips"
-            className={`p-2 rounded-xl border transition shrink-0 ${
-              showMediaPanel
-                ? "bg-indigo-500/15 border-indigo-500/40 text-indigo-300"
-                : "bg-studio-850 border-studio-700 text-zinc-400 hover:text-white"
+            onClick={() => setShowLeftPanel((v) => !v)}
+            title="Mostrar/ocultar Capas y Biblioteca"
+            aria-label="Alternar panel izquierdo"
+            className={`p-2 rounded-xl border transition-colors shrink-0 ${
+              showLeftPanel
+                ? "bg-sky-500/15 border-sky-400/40 text-sky-300"
+                : "bg-studio-850 border-white/[0.08] text-zinc-400 hover:text-white"
             }`}
           >
             <PanelLeft className="w-4 h-4" />
           </button>
+
+          <div className="hidden md:flex items-center pr-1.5 border-r border-white/[0.08]">
+            <BrandLogo size="sm" />
+          </div>
 
           {editingTitle && canEdit ? (
             <input
@@ -1502,13 +2808,13 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
                 if (e.key === "Enter") void handleTitleSave();
                 if (e.key === "Escape") setEditingTitle(false);
               }}
-              className="rounded-lg bg-studio-950 border border-indigo-500 px-2.5 py-1 text-sm font-semibold text-white outline-none w-56"
+              className="rounded-lg bg-studio-950 border border-sky-400 px-2.5 py-1 text-sm font-semibold text-white outline-none w-48"
             />
           ) : (
             <button
               type="button"
               onClick={() => canEdit && setEditingTitle(true)}
-              className="text-sm font-semibold text-white hover:text-indigo-300 truncate max-w-[220px] transition text-left"
+              className="text-sm font-semibold text-white hover:text-sky-300 truncate max-w-[180px] transition-colors text-left"
               title="Clic para renombrar tablero"
             >
               {title}
@@ -1529,16 +2835,23 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
             ) : (
               <Radio className="w-3 h-3 animate-pulse" />
             )}
-            <span>
+            <span className="hidden lg:inline">
               {connectionStatus === "connected"
-                ? "Sincronizado en vivo"
+                ? "En vivo"
                 : connectionStatus === "connecting"
-                  ? "Conectando..."
+                  ? "Conectando…"
                   : "Reconectando"}
             </span>
           </span>
 
-          {!canEdit && (
+          {myPaused && (
+            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/20 border border-amber-400/40 text-amber-200 animate-pulse">
+              <PauseCircle className="w-3.5 h-3.5" />
+              <span>Pausado (Solo lectura)</span>
+            </span>
+          )}
+
+          {!myPaused && myRole === "viewer" && (
             <span className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-zinc-800 border border-zinc-700 text-zinc-300">
               Solo lectura
             </span>
@@ -1547,26 +2860,32 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
 
         {/* Right Controls */}
         <div className="flex items-center gap-2 shrink-0">
-          {/* Active remote collaborator avatars */}
-          {Object.values(remoteCursors).length > 0 && (
-            <div className="hidden md:flex items-center -space-x-1.5 mr-1">
-              {Object.values(remoteCursors).map((c) => (
-                <div
-                  key={c.clientId}
-                  title={`${c.name} conectado`}
-                  className="w-7 h-7 rounded-full border-2 border-studio-900 flex items-center justify-center text-[10px] font-bold text-white"
-                  style={{ backgroundColor: c.color }}
-                >
-                  {c.name.slice(0, 2).toUpperCase()}
-                </div>
-              ))}
-            </div>
-          )}
+          <CollaboratorsBar
+            boardId={initialBoard.id}
+            ownerId={initialBoard.ownerId}
+            ownerName={initialBoard.ownerName}
+            ownerEmail={initialBoard.ownerEmail}
+            myRole={myRole}
+            members={members}
+            onlineMembers={onlineMembers}
+            elements={elements}
+            onMembersChange={setMembers}
+            onAuthorVisibility={handleAuthorVisibility}
+            onAuthorDelete={handleAuthorDelete}
+            onMemberElementsDeleted={(ids) => {
+              const delSet = new Set(ids);
+              setElements((prev) => prev.filter((e) => !delSet.has(e.id)));
+              setSelectedIds((prev) => prev.filter((id) => !delSet.has(id)));
+            }}
+            onBroadcastMemberUpdated={broadcastMemberUpdated}
+            onBroadcastMemberKicked={broadcastMemberKicked}
+            onOpenShareModal={() => setShareOpen(true)}
+          />
 
           <button
             type="button"
             onClick={copyObsUrl}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-studio-850 hover:bg-studio-800 border border-indigo-500/40 text-indigo-200 text-xs font-medium transition"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-studio-850 hover:bg-studio-800 border border-sky-400/35 text-sky-200 text-xs font-medium transition-colors"
             title="Copiar enlace transparente para OBS Studio"
           >
             {copiedObs ? (
@@ -1576,7 +2895,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
               </>
             ) : (
               <>
-                <Copy className="w-3.5 h-3.5 text-indigo-400" />
+                <Copy className="w-3.5 h-3.5 text-sky-400" />
                 <span className="hidden sm:inline">Copiar URL OBS</span>
               </>
             )}
@@ -1587,7 +2906,8 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
             target="_blank"
             rel="noopener noreferrer"
             title="Abrir vista limpia de OBS en otra pestaña"
-            className="p-2 rounded-xl bg-studio-850 hover:bg-studio-800 border border-studio-700 text-zinc-300 hover:text-white transition"
+            aria-label="Abrir vista limpia OBS"
+            className="p-2 rounded-xl bg-studio-850 hover:bg-studio-800 border border-white/[0.08] text-zinc-300 hover:text-white transition-colors"
           >
             <ExternalLink className="w-4 h-4" />
           </a>
@@ -1595,20 +2915,31 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
           <button
             type="button"
             onClick={() => setShareOpen(true)}
-            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition shadow-md shadow-indigo-600/20"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold transition-colors shadow-md shadow-sky-600/20"
           >
             <Share2 className="w-3.5 h-3.5" />
-            <span>Compartir</span>
+            <span className="hidden sm:inline">Compartir</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setTutorialOpen(true)}
+            title="Ver tutorial rápido"
+            aria-label="Abrir guía tutorial"
+            className="p-2 rounded-xl bg-studio-850 hover:bg-studio-800 border border-white/[0.08] text-zinc-300 hover:text-sky-300 transition-colors"
+          >
+            <HelpCircle className="w-4 h-4" />
           </button>
 
           <button
             type="button"
             onClick={() => setShowRightPanel((v) => !v)}
-            title="Mostrar/ocultar panel de capas y propiedades"
-            className={`p-2 rounded-xl border transition ${
+            title="Mostrar/ocultar panel de Estilo, Animación y Presets"
+            aria-label="Alternar panel derecho"
+            className={`p-2 rounded-xl border transition-colors ${
               showRightPanel
-                ? "bg-indigo-500/15 border-indigo-500/40 text-indigo-300"
-                : "bg-studio-850 border-studio-700 text-zinc-400 hover:text-white"
+                ? "bg-sky-500/15 border-sky-400/40 text-sky-300"
+                : "bg-studio-850 border-white/[0.08] text-zinc-400 hover:text-white"
             }`}
           >
             <PanelRight className="w-4 h-4" />
@@ -1618,58 +2949,117 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
 
       {/* Main Workspace */}
       <div className="flex-1 flex min-h-0 relative">
-        {/* Left Media Library Sidebar */}
-        {showMediaPanel && (
-          <MediaLibraryPanel
+        {/* Left Dock: Capas & Biblioteca Compartida */}
+        {showLeftPanel && (
+          <LeftDockPanel
+            boardId={initialBoard.id}
+            elements={elements}
+            selectedIds={selectedIds}
             assets={assets}
-            boardElements={elements}
+            folders={folders}
             canEdit={canEdit}
-            onAssetUploaded={(asset) => setAssets((prev) => [asset, ...prev])}
-            onAssetDeleted={(id) =>
-              setAssets((prev) => prev.filter((a) => a.id !== id))
-            }
+            onSelectElements={(ids) => {
+              setSelectedIds(ids);
+              setEditingTextId(null);
+            }}
+            onPatchElement={(id, patch) => handlePatchElement(id, patch, true)}
+            onDeleteElements={handleDeleteElements}
+            onDuplicateElement={handleDuplicateElement}
+            onMoveLayer={handleMoveLayer}
+            onReorderLayer={handleReorderLayer}
+            onTriggerVideo={handleTriggerVideo}
+            onHideAllVideos={handleHideAllVideos}
+            onShowAllLayers={handleShowAllLayers}
+            onAssetUploaded={(asset) => {
+              setAssets((prev) => [
+                asset,
+                ...prev.filter((a) => a.id !== asset.id),
+              ]);
+              broadcastLibraryUpdated();
+            }}
+            onAssetUpdated={(asset) => {
+              setAssets((prev) =>
+                prev.map((a) => (a.id === asset.id ? asset : a))
+              );
+              broadcastLibraryUpdated();
+            }}
+            onAssetDeleted={(id) => {
+              setAssets((prev) => prev.filter((a) => a.id !== id));
+              broadcastLibraryUpdated();
+            }}
+            onFolderCreated={(folder) => {
+              setFolders((prev) => [...prev, folder]);
+              broadcastLibraryUpdated();
+            }}
+            onFolderUpdated={(folder) => {
+              setFolders((prev) =>
+                prev.map((f) => (f.id === folder.id ? folder : f))
+              );
+              broadcastLibraryUpdated();
+            }}
+            onFolderDeleted={(folderId) => {
+              setFolders((prev) => prev.filter((f) => f.id !== folderId));
+              setAssets((prev) =>
+                prev.map((a) =>
+                  a.folderId === folderId ? { ...a, folderId: null } : a
+                )
+              );
+              broadcastLibraryUpdated();
+            }}
             onInsertAsset={(asset, options) => handleInsertAsset(asset, options)}
-            onQuickTriggerExisting={(elId) =>
-              handleTriggerVideo(elId, {
-                restart: true,
-                playing: true,
-                visible: true,
-              })
-            }
+            onApplyFontAsset={handleApplyFontAsset}
+            onOpenDocumentModal={() => {
+              setPendingDocFile(null);
+              setDocModalOpen(true);
+            }}
           />
         )}
 
         {/* Infinite Canvas Viewport */}
         <div
           ref={viewportRef}
+          data-tour="stage"
           className="flex-1 relative overflow-hidden bg-studio-950 touch-none"
           style={{ cursor: cursorStyle }}
           onPointerDown={handleStagePointerDown}
           onPointerMove={handleStagePointerMove}
-          onPointerUp={handleStagePointerUp}
-          onWheel={handleWheel}
+          onPointerUp={(e) => finishInteraction(e.pointerId)}
+          onPointerCancel={(e) => finishInteraction(e.pointerId)}
+          onLostPointerCapture={() => cancelActiveInteraction()}
+          onPointerLeave={() => setEraserCursorPos(null)}
           onDragOver={(e) => e.preventDefault()}
           onDrop={handleDrop}
         >
           {/* Floating Toolbar */}
           <div
-            className="pointer-events-none absolute top-3.5 left-1/2 -translate-x-1/2 z-30"
+            className="pointer-events-none absolute top-3.5 left-1/2 -translate-x-1/2 w-[calc(100%-24px)] flex justify-center z-30"
             onPointerDown={(e) => e.stopPropagation()}
           >
             <EditorToolbar
               tool={tool}
-              onSelectTool={setTool}
+              onSelectTool={(nextTool) => {
+                setTool(nextTool);
+                if (nextTool !== "eraser") setEraserCursorPos(null);
+              }}
               canEdit={canEdit}
               canUndo={undoStack.length > 0}
               canRedo={redoStack.length > 0}
               onUndo={handleUndo}
               onRedo={handleRedo}
-              zoom={zoom}
-              onZoomIn={() => setZoom((z) => Math.min(3.5, z * 1.15))}
-              onZoomOut={() => setZoom((z) => Math.max(0.15, z * 0.85))}
-              onFitStage={fitStageToViewport}
+              zoom={camera.zoom}
+              onZoomIn={() => zoomAtPoint(1.18)}
+              onZoomOut={() => zoomAtPoint(0.84)}
+              onFitStage={() => fitStageToViewport(false)}
               backdrop={backdrop}
               onBackdropChange={setBackdrop}
+              snapEnabled={snapEnabled}
+              onToggleSnap={() => setSnapEnabled((v) => !v)}
+              guidesConfig={guidesConfig}
+              onGuidesConfigChange={setGuidesConfig}
+              onOpenDocumentModal={() => {
+                setPendingDocFile(null);
+                setDocModalOpen(true);
+              }}
             />
           </div>
 
@@ -1696,7 +3086,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
               left: 0,
               top: 0,
               transformOrigin: "0 0",
-              transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+              transform: `translate(${camera.x}px, ${camera.y}px) scale(${camera.zoom})`,
             }}
           >
             {/* 1920x1080 OBS Guide Frame */}
@@ -1706,61 +3096,132 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
                 width: STAGE_WIDTH,
                 height: STAGE_HEIGHT,
                 boxShadow:
-                  "0 0 0 3px rgba(99, 102, 241, 0.75), 0 30px 90px rgba(0, 0, 0, 0.65)",
+                  "0 0 0 2px rgba(56, 189, 248, 0.72), 0 30px 90px rgba(0, 0, 0, 0.7)",
               }}
             >
               {/* OBS Guide Label (Editor ONLY) */}
               <div
-                className="pointer-events-none select-none absolute left-0 flex items-center gap-2.5 px-3 py-1 rounded-t-lg bg-indigo-600/95 text-white font-mono font-semibold tracking-wide whitespace-nowrap"
+                className="pointer-events-none select-none absolute left-0 flex items-center gap-2.5 px-3 py-1 rounded-t-lg bg-sky-600/95 text-white font-mono font-semibold tracking-wide whitespace-nowrap"
                 style={{
                   bottom: "100%",
                   transformOrigin: "bottom left",
-                  transform: `scale(${1 / zoom})`,
+                  transform: `scale(${1 / camera.zoom})`,
                   fontSize: 11,
                 }}
               >
-                <span>ÁREA OBS • 1920×1080 (16:9)</span>
-                <span className="text-indigo-200 font-normal">
+                <span>ÁREA OBS · 1920×1080 (16:9)</span>
+                <span className="text-sky-100/90 font-normal">
                   Fondo 100% transparente en directo
                 </span>
               </div>
 
-              {/* Subtle corner guide crosshairs (Editor ONLY) */}
-              <div className="pointer-events-none absolute inset-0 border-2 border-dashed border-indigo-400/40" />
+              <div className="pointer-events-none absolute inset-0 border border-dashed border-sky-400/35" />
+
+              {/* Optional Board Guides Overlay (Editor ONLY — NEVER IN OBS) */}
+              {guidesConfig.enabled && (
+                <svg
+                  width={STAGE_WIDTH}
+                  height={STAGE_HEIGHT}
+                  viewBox={`0 0 ${STAGE_WIDTH} ${STAGE_HEIGHT}`}
+                  className="pointer-events-none absolute inset-0"
+                  style={{ zIndex: 9990 }}
+                >
+                  {guidesConfig.showCenterAxes && (
+                    <g
+                      stroke="rgba(56, 189, 248, 0.45)"
+                      strokeWidth={1.5 / camera.zoom}
+                      strokeDasharray={`${8 / camera.zoom} ${6 / camera.zoom}`}
+                    >
+                      <line x1={STAGE_WIDTH / 2} y1={0} x2={STAGE_WIDTH / 2} y2={STAGE_HEIGHT} />
+                      <line x1={0} y1={STAGE_HEIGHT / 2} x2={STAGE_WIDTH} y2={STAGE_HEIGHT / 2} />
+                    </g>
+                  )}
+                  {guidesConfig.showRuleOfThirds && (
+                    <g
+                      stroke="rgba(148, 163, 184, 0.28)"
+                      strokeWidth={1 / camera.zoom}
+                      strokeDasharray={`${5 / camera.zoom} ${5 / camera.zoom}`}
+                    >
+                      <line x1={STAGE_WIDTH / 3} y1={0} x2={STAGE_WIDTH / 3} y2={STAGE_HEIGHT} />
+                      <line x1={(STAGE_WIDTH * 2) / 3} y1={0} x2={(STAGE_WIDTH * 2) / 3} y2={STAGE_HEIGHT} />
+                      <line x1={0} y1={STAGE_HEIGHT / 3} x2={STAGE_WIDTH} y2={STAGE_HEIGHT / 3} />
+                      <line x1={0} y1={(STAGE_HEIGHT * 2) / 3} x2={STAGE_WIDTH} y2={(STAGE_HEIGHT * 2) / 3} />
+                    </g>
+                  )}
+                  {guidesConfig.showSafeZones && (
+                    <rect
+                      x={STAGE_WIDTH * 0.05}
+                      y={STAGE_HEIGHT * 0.05}
+                      width={STAGE_WIDTH * 0.9}
+                      height={STAGE_HEIGHT * 0.9}
+                      fill="none"
+                      stroke="rgba(16, 185, 129, 0.35)"
+                      strokeWidth={1.5 / camera.zoom}
+                      strokeDasharray={`${10 / camera.zoom} ${6 / camera.zoom}`}
+                    />
+                  )}
+                </svg>
+              )}
 
               {/* Rendered Board Elements */}
-              {elements.map((el) => (
-                <StageElement
-                  key={el.id}
-                  element={el}
-                  mode="editor"
-                  isEditingText={editingTextId === el.id}
-                  onTextChange={(nextText) =>
-                    handlePatchElement(el.id, { text: nextText }, false)
-                  }
-                  onTextBlur={() => {
-                    const current = elementsRef.current.find(
-                      (i) => i.id === el.id
-                    );
-                    if (current) {
-                      void persistPatch(el.id, { text: current.text });
-                    }
-                    setEditingTextId(null);
-                  }}
-                  onVideoAutoHide={(elId) => {
-                    handlePatchElement(elId, { visible: false, playing: false });
-                  }}
-                  onPointerDown={(e) => handleElementPointerDown(e, el)}
-                  onDoubleClick={(e) => {
-                    if (!canEdit || el.locked) return;
-                    if (el.type === "text") {
-                      e.stopPropagation();
-                      setSelectedId(el.id);
-                      setEditingTextId(el.id);
-                    }
-                  }}
-                />
-              ))}
+              {elements.map((el) => {
+                const markedErase = eraserPreviewIds.has(el.id);
+                return (
+                  <div
+                    key={el.id}
+                    style={{
+                      opacity: markedErase ? 0.3 : 1,
+                      filter: markedErase ? "brightness(1.2)" : undefined,
+                      display: "contents",
+                    }}
+                  >
+                    <StageElement
+                      element={
+                        markedErase ? { ...el, opacity: (el.opacity ?? 1) * 0.3 } : el
+                      }
+                      mode="editor"
+                      isEditingText={editingTextId === el.id}
+                      onTextChange={(nextText) =>
+                        handlePatchElement(el.id, { text: nextText }, false)
+                      }
+                      onTextResize={(nextHeight) =>
+                        handlePatchElement(el.id, { height: nextHeight }, false)
+                      }
+                      onTextBlur={() => {
+                        const current = elementsRef.current.find(
+                          (i) => i.id === el.id
+                        );
+                        if (current) {
+                          if (!(current.text ?? "").trim()) {
+                            handleDeleteElements([el.id]);
+                          } else {
+                            persistPatch(el.id, {
+                              text: current.text,
+                              height: current.height,
+                            });
+                          }
+                        }
+                        setEditingTextId(null);
+                      }}
+                      onVideoAutoHide={(elId) => {
+                        handlePatchElement(elId, {
+                          visible: false,
+                          playing: false,
+                        });
+                      }}
+                      onPointerDown={(e) => handleElementPointerDown(e, el)}
+                      onDoubleClick={(e) => {
+                        if (!canEdit || el.locked) return;
+                        if (el.type === "text") {
+                          e.stopPropagation();
+                          setSelectedIds([el.id]);
+                          setEditingTextId(el.id);
+                        }
+                      }}
+                    />
+                  </div>
+                );
+              })}
 
               {/* Active Local Draft Element */}
               {draftElement && (
@@ -1769,46 +3230,107 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
 
               {/* Remote Collaborator Live Draft Strokes */}
               {Object.values(remoteDrafts).map((draft) => (
-                <StageElement key={draft.id} element={draft} mode="editor" />
+                <StageElement
+                  key={draft.element.id}
+                  element={draft.element}
+                  mode="editor"
+                />
               ))}
 
-              {/* Selection & Transform Controls (EDITOR ONLY — NEVER IN OBS) */}
-              {selectedElement &&
-                selectedElement.visible &&
+              {/* Active Magnetic Snap Guide Lines (Editor ONLY) */}
+              {activeSnapGuides.length > 0 && (
+                <svg
+                  width={STAGE_WIDTH}
+                  height={STAGE_HEIGHT}
+                  viewBox={`0 0 ${STAGE_WIDTH} ${STAGE_HEIGHT}`}
+                  className="pointer-events-none absolute inset-0 overflow-visible"
+                  style={{ zIndex: 9995 }}
+                >
+                  {activeSnapGuides.map((g, idx) => (
+                    <line
+                      key={idx}
+                      x1={g.orientation === "v" ? g.pos : g.start}
+                      y1={g.orientation === "v" ? g.start : g.pos}
+                      x2={g.orientation === "v" ? g.pos : g.end}
+                      y2={g.orientation === "v" ? g.end : g.pos}
+                      stroke={g.kind === "center" ? "#f43f5e" : "#38bdf8"}
+                      strokeWidth={1.75 / camera.zoom}
+                      strokeDasharray={
+                        g.kind === "element"
+                          ? undefined
+                          : `${6 / camera.zoom} ${4 / camera.zoom}`
+                      }
+                    />
+                  ))}
+                </svg>
+              )}
+
+              {/* Marquee Drag Selection Box */}
+              {marqueeBox && (
+                <div
+                  className="pointer-events-none absolute bg-sky-500/10 border border-sky-400"
+                  style={{
+                    left: marqueeBox.x,
+                    top: marqueeBox.y,
+                    width: marqueeBox.width,
+                    height: marqueeBox.height,
+                    borderWidth: 1.5 / camera.zoom,
+                    zIndex: 9996,
+                  }}
+                />
+              )}
+
+              {/* Eraser Cursor Circle */}
+              {tool === "eraser" && eraserCursorPos && (
+                <div
+                  className="pointer-events-none absolute rounded-full border-2 border-rose-400 bg-rose-500/15"
+                  style={{
+                    left: eraserCursorPos.x - drawDefaults.eraserSize / 2,
+                    top: eraserCursorPos.y - drawDefaults.eraserSize / 2,
+                    width: drawDefaults.eraserSize,
+                    height: drawDefaults.eraserSize,
+                    borderWidth: Math.max(1.5, 2 / camera.zoom),
+                    zIndex: 9997,
+                  }}
+                />
+              )}
+
+              {/* Single Selection & Transform Controls (EDITOR ONLY — works even when ghost-hidden!) */}
+              {singleSelected &&
                 canEdit &&
-                !selectedElement.locked &&
-                editingTextId !== selectedElement.id && (
+                !singleSelected.locked &&
+                editingTextId !== singleSelected.id && (
                   <div
                     className="pointer-events-none"
                     style={{
                       position: "absolute",
-                      left: selectedElement.x,
-                      top: selectedElement.y,
-                      width: Math.max(12, selectedElement.width),
-                      height: Math.max(12, selectedElement.height),
-                      transform: selectedElement.rotation
-                        ? `rotate(${selectedElement.rotation}deg)`
+                      left: singleSelected.x,
+                      top: singleSelected.y,
+                      width: Math.max(12, singleSelected.width),
+                      height: Math.max(12, singleSelected.height),
+                      transform: singleSelected.rotation
+                        ? `rotate(${singleSelected.rotation}deg)`
                         : undefined,
                       transformOrigin: "center center",
                       zIndex: 9998,
                     }}
                   >
                     <div
-                      className="absolute inset-0 border-2 border-indigo-400"
-                      style={{ borderWidth: Math.max(1.5, 2 / zoom) }}
+                      className="absolute inset-0 border-2 border-sky-400"
+                      style={{ borderWidth: Math.max(1.5, 2 / camera.zoom) }}
                     />
 
                     {/* Rotation handle */}
                     <div
                       onPointerDown={(e) =>
-                        handleRotatePointerDown(e, selectedElement)
+                        handleRotatePointerDown(e, singleSelected)
                       }
-                      title="Rotar (mantén Shift para 15°)"
-                      className="pointer-events-auto absolute left-1/2 -translate-x-1/2 rounded-full bg-indigo-500 border-2 border-white shadow cursor-grab"
+                      title="Rotar (Shift para 15° · Alt desactiva imán)"
+                      className="pointer-events-auto absolute left-1/2 -translate-x-1/2 rounded-full bg-sky-400 border-2 border-white shadow cursor-grab"
                       style={{
-                        top: -34 / zoom,
-                        width: 14 / zoom,
-                        height: 14 / zoom,
+                        top: -34 / camera.zoom,
+                        width: 14 / camera.zoom,
+                        height: 14 / camera.zoom,
                       }}
                     />
 
@@ -1828,14 +3350,14 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
                       <div
                         key={handle}
                         onPointerDown={(e) =>
-                          handleResizePointerDown(e, selectedElement, handle)
+                          handleResizePointerDown(e, singleSelected, handle)
                         }
-                        className="pointer-events-auto absolute rounded-sm bg-white border-2 border-indigo-500 shadow"
+                        className="pointer-events-auto absolute rounded-sm bg-white border-2 border-sky-500 shadow"
                         style={{
                           left: `${leftPct}%`,
                           top: `${topPct}%`,
-                          width: 12 / zoom,
-                          height: 12 / zoom,
+                          width: 12 / camera.zoom,
+                          height: 12 / camera.zoom,
                           transform: "translate(-50%, -50%)",
                           cursor,
                         }}
@@ -1843,6 +3365,48 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
                     ))}
                   </div>
                 )}
+
+              {/* Multi-Selection Bounding Frame (draggable group handle) */}
+              {multiBounds && (
+                <div
+                  onPointerDown={(e) => {
+                    if (tool !== "select" || spacePressed || e.button !== 0 || !canEdit)
+                      return;
+                    e.stopPropagation();
+                    const pt = screenToStage(e.clientX, e.clientY);
+                    const itemsToMove = elementsRef.current
+                      .filter(
+                        (item) =>
+                          selectedIdsRef.current.includes(item.id) &&
+                          !item.locked
+                      )
+                      .map((item) => ({
+                        id: item.id,
+                        origX: item.x,
+                        origY: item.y,
+                      }));
+                    if (itemsToMove.length === 0) return;
+                    interactionRef.current = {
+                      kind: "move",
+                      pointerId: e.pointerId,
+                      startStageX: pt.x,
+                      startStageY: pt.y,
+                      items: itemsToMove,
+                      moved: false,
+                    };
+                    viewportRef.current?.setPointerCapture(e.pointerId);
+                  }}
+                  className="pointer-events-auto cursor-move absolute border-2 border-dashed border-sky-400 bg-sky-500/[0.03]"
+                  style={{
+                    left: multiBounds.left,
+                    top: multiBounds.top,
+                    width: multiBounds.width,
+                    height: multiBounds.height,
+                    borderWidth: Math.max(1.5, 2 / camera.zoom),
+                    zIndex: 9998,
+                  }}
+                />
+              )}
 
               {/* Remote Collaborator Cursors (EDITOR ONLY — NEVER IN OBS) */}
               {Object.values(remoteCursors).map((cursor) => (
@@ -1853,7 +3417,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
                     left: cursor.x,
                     top: cursor.y,
                     zIndex: 9999,
-                    transform: `scale(${1 / zoom})`,
+                    transform: `scale(${1 / camera.zoom})`,
                     transformOrigin: "0 0",
                   }}
                 >
@@ -1879,40 +3443,47 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
           </div>
 
           {/* Subtle bottom shortcut hint */}
-          <div className="pointer-events-none absolute bottom-3 left-3 z-20 hidden lg:flex items-center gap-3 px-3 py-1.5 rounded-xl bg-studio-900/80 border border-studio-800 text-[11px] text-zinc-400 backdrop-blur">
+          <div className="pointer-events-none absolute bottom-3 left-3 z-20 hidden lg:flex items-center gap-3 px-3 py-1.5 rounded-xl bg-studio-900/85 border border-white/[0.08] text-[11px] text-zinc-400 backdrop-blur">
             <span>
               <kbd className="text-zinc-200 font-mono">Espacio</kbd> + arrastrar:
               mover vista
             </span>
-            <span>•</span>
+            <span>·</span>
             <span>
-              <kbd className="text-zinc-200 font-mono">Shift+H</kbd>: ocultar/mostrar
-              capa en OBS
+              <kbd className="text-zinc-200 font-mono">V</kbd> arrastre múltiple
             </span>
-            <span>•</span>
-            <span>Arrastra MP4/WebM/PNG directo al lienzo</span>
+            <span>·</span>
+            <span>
+              <kbd className="text-zinc-200 font-mono">M</kbd> imán ·{" "}
+              <kbd className="text-zinc-200 font-mono">G</kbd> guías
+            </span>
+            <span>·</span>
+            <span>Suelta PDF, MP4, WebM, PNG o fuentes aquí</span>
           </div>
         </div>
 
-        {/* Right Layers & Inspector Sidebar */}
+        {/* Right Dock: Estilo (DEFAULT FIRST), Animación, Presets */}
         {showRightPanel && (
-          <LayersInspectorPanel
-            elements={elements}
-            selectedId={selectedId}
+          <StyleInspectorPanel
+            boardId={initialBoard.id}
+            tool={tool}
+            selectedElements={selectedElements}
             canEdit={canEdit}
             drawDefaults={drawDefaults}
+            customFonts={customFonts}
             onDrawDefaultsChange={setDrawDefaults}
-            onSelectElement={(id) => {
-              setSelectedId(id);
-              setEditingTextId(null);
-            }}
             onPatchElement={(id, patch) => handlePatchElement(id, patch, true)}
-            onDeleteElement={handleDeleteElement}
+            onBatchPatch={handleBatchPatch}
+            onDeleteElements={handleDeleteElements}
             onDuplicateElement={handleDuplicateElement}
-            onMoveLayer={handleMoveLayer}
             onTriggerVideo={handleTriggerVideo}
-            onHideAllVideos={handleHideAllVideos}
-            onShowAllLayers={handleShowAllLayers}
+            onFontUploaded={(asset) => {
+              setAssets((prev) => [
+                asset,
+                ...prev.filter((a) => a.id !== asset.id),
+              ]);
+              broadcastLibraryUpdated();
+            }}
           />
         )}
       </div>
@@ -1924,11 +3495,33 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         boardId={initialBoard.id}
         boardTitle={title}
         obsToken={obsToken}
-        myRole={initialBoard.myRole}
+        myRole={myRole}
         initialMembers={members}
         onObsTokenChange={setObsToken}
         onMembersChange={setMembers}
+        onMemberElementsDeleted={(ids) => {
+          const delSet = new Set(ids);
+          setElements((prev) => prev.filter((e) => !delSet.has(e.id)));
+          setSelectedIds((prev) => prev.filter((id) => !delSet.has(id)));
+        }}
+        onBroadcastMemberUpdated={broadcastMemberUpdated}
+        onBroadcastMemberKicked={broadcastMemberKicked}
       />
+
+      {/* Document Attachment Modal */}
+      <DocumentAttachModal
+        open={docModalOpen}
+        boardId={initialBoard.id}
+        initialFile={pendingDocFile}
+        onClose={() => {
+          setDocModalOpen(false);
+          setPendingDocFile(null);
+        }}
+        onDocumentInserted={handleDocumentInserted}
+      />
+
+      {/* Onboarding Tutorial */}
+      <OnboardingTutorial open={tutorialOpen} onClose={closeTutorial} />
     </div>
   );
 };

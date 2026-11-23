@@ -1,10 +1,13 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
+import { realtimeHub } from "@/lib/realtime-hub";
 import {
-  listMediaForUser,
+  listBoardMediaLibrary,
   registerCloudMediaAsset,
   saveMediaAsset,
+  saveRawLocalUpload,
 } from "@/lib/store";
+import type { MediaAsset } from "@/types/board";
 
 const MAX_UPLOAD_BYTES = 80 * 1024 * 1024; // 80 MB
 
@@ -24,13 +27,17 @@ const ALLOWED_IMAGE_MIMES = new Set([
   "image/avif",
 ]);
 
-export async function GET() {
+const ALLOWED_FONT_EXT = /\.(ttf|otf|woff|woff2)$/i;
+
+export async function GET(req: Request) {
   const user = await getCurrentUser();
   if (!user) {
     return NextResponse.json({ error: "No autenticado" }, { status: 401 });
   }
-  const assets = await listMediaForUser(user);
-  return NextResponse.json({ assets });
+  const url = new URL(req.url);
+  const boardId = url.searchParams.get("boardId");
+  const { assets, folders } = await listBoardMediaLibrary(user, boardId);
+  return NextResponse.json({ assets, folders });
 }
 
 export async function POST(req: Request) {
@@ -42,12 +49,11 @@ export async function POST(req: Request) {
   try {
     const contentType = req.headers.get("content-type") ?? "";
 
-    // Direct browser-to-Supabase Storage metadata registration (bypasses Vercel 4.5 MB API limit)
     if (contentType.includes("application/json")) {
       const body = (await req.json()) as {
         id?: string;
         name?: string;
-        kind?: "video" | "image";
+        kind?: MediaAsset["kind"];
         mimeType?: string;
         url?: string;
         fileName?: string;
@@ -56,6 +62,10 @@ export async function POST(req: Request) {
         height?: number;
         durationSec?: number;
         tags?: string[];
+        boardId?: string | null;
+        folderId?: string | null;
+        color?: string;
+        metadata?: MediaAsset["metadata"];
       };
 
       if (!body.url || !body.fileName || !body.kind || !body.mimeType) {
@@ -65,10 +75,17 @@ export async function POST(req: Request) {
         );
       }
 
+      const validKind: MediaAsset["kind"] =
+        body.kind === "video" ||
+        body.kind === "document" ||
+        body.kind === "font"
+          ? body.kind
+          : "image";
+
       const asset = await registerCloudMediaAsset(user, {
         id: body.id ?? "",
         name: body.name ?? "Archivo media",
-        kind: body.kind === "video" ? "video" : "image",
+        kind: validKind,
         mimeType: body.mimeType,
         url: body.url,
         fileName: body.fileName,
@@ -77,7 +94,19 @@ export async function POST(req: Request) {
         height: body.height,
         durationSec: body.durationSec,
         tags: body.tags ?? [],
+        boardId: body.boardId ?? null,
+        folderId: body.folderId ?? null,
+        color: body.color,
+        metadata: body.metadata,
       });
+
+      if (asset.boardId) {
+        realtimeHub.broadcast(asset.boardId, {
+          type: "library:updated",
+          senderId: user.id,
+          boardId: asset.boardId,
+        });
+      }
 
       return NextResponse.json({ asset }, { status: 201 });
     }
@@ -105,6 +134,14 @@ export async function POST(req: Request) {
       );
     }
 
+    const arrayBuffer = await file.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    if (formData.get("rawOnly") === "true") {
+      const saved = await saveRawLocalUpload(file.name, buffer);
+      return NextResponse.json({ url: saved.url, fileName: saved.fileName }, { status: 201 });
+    }
+
     const mimeType = file.type || "";
     const lowerName = file.name.toLowerCase();
     const isVideo =
@@ -113,24 +150,42 @@ export async function POST(req: Request) {
     const isImage =
       ALLOWED_IMAGE_MIMES.has(mimeType) ||
       /\.(png|jpe?g|webp|gif|svg|avif)$/i.test(lowerName);
+    const isFont =
+      ALLOWED_FONT_EXT.test(lowerName) ||
+      mimeType.startsWith("font/") ||
+      mimeType === "application/font-woff" ||
+      mimeType === "application/x-font-ttf";
 
-    if (!isVideo && !isImage) {
+    if (!isVideo && !isImage && !isFont) {
       return NextResponse.json(
         {
           error:
-            "Formato no soportado. Sube videos (MP4, WebM, MOV) o imágenes (PNG, JPG, WebP, GIF).",
+            "Formato no soportado. Usa videos (MP4, WebM, MOV), imágenes (PNG, JPG, WebP, GIF) o fuentes (TTF, OTF, WOFF, WOFF2).",
         },
         { status: 400 }
       );
     }
 
+    const kind: MediaAsset["kind"] = isVideo
+      ? "video"
+      : isFont
+        ? "font"
+        : "image";
     const resolvedMime =
       mimeType ||
       (isVideo
         ? lowerName.endsWith(".webm")
           ? "video/webm"
           : "video/mp4"
-        : "image/png");
+        : isFont
+          ? lowerName.endsWith(".woff2")
+            ? "font/woff2"
+            : lowerName.endsWith(".woff")
+              ? "font/woff"
+              : lowerName.endsWith(".otf")
+                ? "font/otf"
+                : "font/ttf"
+          : "image/png");
 
     const nameField = formData.get("name");
     const customName =
@@ -141,6 +196,32 @@ export async function POST(req: Request) {
     const widthVal = Number(formData.get("width") || 0) || undefined;
     const heightVal = Number(formData.get("height") || 0) || undefined;
     const durationVal = Number(formData.get("durationSec") || 0) || undefined;
+    const boardIdField = formData.get("boardId");
+    const boardId =
+      typeof boardIdField === "string" && boardIdField.trim()
+        ? boardIdField.trim()
+        : null;
+    const folderIdField = formData.get("folderId");
+    const folderId =
+      typeof folderIdField === "string" && folderIdField.trim()
+        ? folderIdField.trim()
+        : null;
+    const colorField = formData.get("color");
+    const color =
+      typeof colorField === "string" && colorField.trim()
+        ? colorField.trim()
+        : undefined;
+
+    let metadata: MediaAsset["metadata"];
+    const metadataRaw = formData.get("metadata");
+    if (typeof metadataRaw === "string" && metadataRaw.trim()) {
+      try {
+        metadata = JSON.parse(metadataRaw) as MediaAsset["metadata"];
+      } catch {
+        // ignore invalid metadata
+      }
+    }
+
     const tagsRaw = formData.get("tags");
     const tags =
       typeof tagsRaw === "string" && tagsRaw.trim()
@@ -150,20 +231,29 @@ export async function POST(req: Request) {
             .filter(Boolean)
         : [];
 
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
     const asset = await saveMediaAsset(user, {
       name: customName,
       originalFileName: file.name,
       mimeType: resolvedMime,
-      kind: isVideo ? "video" : "image",
+      kind,
       buffer,
       width: widthVal,
       height: heightVal,
       durationSec: durationVal,
       tags,
+      boardId,
+      folderId,
+      color,
+      metadata,
     });
+
+    if (asset.boardId) {
+      realtimeHub.broadcast(asset.boardId, {
+        type: "library:updated",
+        senderId: user.id,
+        boardId: asset.boardId,
+      });
+    }
 
     return NextResponse.json({ asset }, { status: 201 });
   } catch (err) {

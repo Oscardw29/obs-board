@@ -8,6 +8,7 @@ import {
   type BoardElement,
   type BoardMember,
   type MediaAsset,
+  type MediaFolder,
   type User,
 } from "@/types/board";
 import { pickAvatarColor } from "./geometry";
@@ -33,6 +34,7 @@ export interface LocalDatabase {
   boards: LocalBoardRecord[];
   members: BoardMember[];
   elements: BoardElement[];
+  folders: MediaFolder[];
   media: MediaAsset[];
 }
 
@@ -81,9 +83,9 @@ function createSeedDatabase(): LocalDatabase {
 
   const demoUser: LocalUserRecord = {
     id: demoId,
-    email: "demo@obsboard.local",
+    email: "demo@oboards.local",
     name: "Streamer Demo",
-    avatarColor: pickAvatarColor("demo@obsboard.local"),
+    avatarColor: pickAvatarColor("demo@oboards.local"),
     passwordHash: hash,
     passwordSalt: salt,
     createdAt: now,
@@ -105,7 +107,7 @@ function createSeedDatabase(): LocalDatabase {
       id: "el_demo_badge_bg",
       boardId,
       type: "rectangle",
-      name: "Etiqueta En Vivo (Fondo)",
+      name: "Etiqueta En Vivo",
       x: 72,
       y: 64,
       width: 390,
@@ -114,12 +116,15 @@ function createSeedDatabase(): LocalDatabase {
       zIndex: 1,
       visible: true,
       locked: false,
-      opacity: 0.92,
-      strokeColor: "#6366f1",
-      fillColor: "#111827",
+      opacity: 0.94,
+      strokeColor: "#38bdf8",
+      fillColor: "#10131c",
       strokeWidth: 4,
       strokeStyle: "solid",
       borderRadius: 18,
+      createdByUserId: demoId,
+      createdByEmail: demoUser.email,
+      createdByName: demoUser.name,
       updatedAt: nowMs,
     },
     {
@@ -128,22 +133,25 @@ function createSeedDatabase(): LocalDatabase {
       type: "text",
       name: "Título Overlay",
       x: 96,
-      y: 82,
+      y: 80,
       width: 350,
-      height: 52,
+      height: 54,
       rotation: 0,
       zIndex: 2,
       visible: true,
       locked: false,
       opacity: 1,
-      text: "OBS Board • En Vivo",
+      text: "OBoardS • En Vivo",
       fontSize: 34,
-      fontFamily: "hand",
+      fontFamily: "Space Grotesk",
       fontWeight: "bold",
       textAlign: "left",
       textColor: "#ffffff",
       textBgColor: "transparent",
       textShadow: true,
+      createdByUserId: demoId,
+      createdByEmail: demoUser.email,
+      createdByName: demoUser.name,
       updatedAt: nowMs,
     },
     {
@@ -162,9 +170,12 @@ function createSeedDatabase(): LocalDatabase {
       visible: true,
       locked: false,
       opacity: 1,
-      strokeColor: "#f43f5e",
+      strokeColor: "#38bdf8",
       strokeWidth: 6,
       strokeStyle: "solid",
+      createdByUserId: demoId,
+      createdByEmail: demoUser.email,
+      createdByName: demoUser.name,
       updatedAt: nowMs,
     },
     {
@@ -174,21 +185,24 @@ function createSeedDatabase(): LocalDatabase {
       name: "Nota rápida",
       x: 710,
       y: 170,
-      width: 520,
-      height: 110,
+      width: 540,
+      height: 118,
       rotation: -2,
       zIndex: 4,
       visible: true,
       locked: false,
       opacity: 1,
-      text: "¡Dibuja aquí o dispara clips\ndesde tu Biblioteca de Media!",
+      text: "¡Dibuja aquí o dispara clips\ndesde tu Biblioteca Compartida!",
       fontSize: 36,
-      fontFamily: "hand",
+      fontFamily: "Caveat",
       fontWeight: "bold",
       textAlign: "left",
       textColor: "#fde047",
-      textBgColor: "rgba(17, 24, 39, 0.72)",
+      textBgColor: "rgba(16, 19, 28, 0.8)",
       textShadow: true,
+      createdByUserId: demoId,
+      createdByEmail: demoUser.email,
+      createdByName: demoUser.name,
       updatedAt: nowMs,
     },
   ];
@@ -198,6 +212,7 @@ function createSeedDatabase(): LocalDatabase {
     boards: [starterBoard],
     members: [],
     elements: starterElements,
+    folders: [],
     media: [],
   };
 }
@@ -223,6 +238,7 @@ export function readLocalDb(): LocalDatabase {
       boards: parsed.boards ?? [],
       members: parsed.members ?? [],
       elements: parsed.elements ?? [],
+      folders: parsed.folders ?? [],
       media: parsed.media ?? [],
     };
   } catch {

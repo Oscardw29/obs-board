@@ -22,7 +22,7 @@ export default async function ObsBoardPage({
         style={{ backgroundColor: "transparent" }}
       >
         <div className="px-4 py-2 rounded-xl bg-black/75 text-rose-300 text-xs font-mono border border-rose-500/40">
-          OBS Board: Token de fuente inválido o regenerado. Copia la URL nueva
+          OBoardS: Token de fuente inválido o regenerado. Copia la URL nueva
           desde Compartir.
         </div>
       </div>

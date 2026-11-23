@@ -2,20 +2,30 @@ import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
 import { realtimeHub } from "@/lib/realtime-hub";
 import {
+  batchPatchElements,
   deleteElements,
+  deleteElementsByAuthor,
   patchElement,
   replaceElements,
+  setElementsVisibilityByAuthor,
   upsertElement,
+  upsertManyElements,
 } from "@/lib/store";
 import type { BoardElement } from "@/types/board";
 
 type ElementMutationBody =
   | { action: "upsert"; senderId: string; element: BoardElement }
+  | { action: "upsertMany"; senderId: string; elements: BoardElement[] }
   | {
       action: "patch";
       senderId: string;
       elementId: string;
       patch: Partial<BoardElement>;
+    }
+  | {
+      action: "batchPatch";
+      senderId: string;
+      patches: Array<{ elementId: string; patch: Partial<BoardElement> }>;
     }
   | { action: "replace"; senderId: string; elements: BoardElement[] }
   | { action: "delete"; senderId: string; elementIds: string[] }
@@ -31,6 +41,19 @@ type ElementMutationBody =
       muted?: boolean;
       volume?: number;
       autoHideOnEnd?: boolean;
+    }
+  | {
+      action: "authorVisibility";
+      senderId: string;
+      userId?: string;
+      email?: string;
+      visible: boolean;
+    }
+  | {
+      action: "authorDelete";
+      senderId: string;
+      userId?: string;
+      email?: string;
     };
 
 export async function POST(
@@ -65,6 +88,19 @@ export async function POST(
     return NextResponse.json({ ok: true, element: res.element });
   }
 
+  if (body.action === "upsertMany") {
+    const res = await upsertManyElements(boardId, user, body.elements);
+    if (!res.ok || !res.elements) {
+      return NextResponse.json({ error: res.error }, { status: 403 });
+    }
+    realtimeHub.broadcast(
+      boardId,
+      { type: "elements:upsertMany", senderId, elements: res.elements },
+      senderId
+    );
+    return NextResponse.json({ ok: true, elements: res.elements });
+  }
+
   if (body.action === "patch") {
     const res = await patchElement(boardId, user, body.elementId, body.patch);
     if (!res.ok || !res.element) {
@@ -81,6 +117,23 @@ export async function POST(
       senderId
     );
     return NextResponse.json({ ok: true, element: res.element });
+  }
+
+  if (body.action === "batchPatch") {
+    const res = await batchPatchElements(boardId, user, body.patches);
+    if (!res.ok) {
+      return NextResponse.json({ error: res.error }, { status: 403 });
+    }
+    realtimeHub.broadcast(
+      boardId,
+      {
+        type: "elements:batchPatch",
+        senderId,
+        patches: body.patches,
+      },
+      senderId
+    );
+    return NextResponse.json({ ok: true, elements: res.elements });
   }
 
   if (body.action === "replace") {
@@ -144,6 +197,44 @@ export async function POST(
       senderId
     );
     return NextResponse.json({ ok: true, element: res.element });
+  }
+
+  if (body.action === "authorVisibility") {
+    const res = await setElementsVisibilityByAuthor(
+      boardId,
+      user,
+      { userId: body.userId, email: body.email },
+      body.visible
+    );
+    if (!res.ok) {
+      return NextResponse.json({ error: res.error }, { status: 403 });
+    }
+    if (res.patches && res.patches.length > 0) {
+      realtimeHub.broadcast(
+        boardId,
+        { type: "elements:batchPatch", senderId, patches: res.patches },
+        senderId
+      );
+    }
+    return NextResponse.json({ ok: true, patches: res.patches ?? [] });
+  }
+
+  if (body.action === "authorDelete") {
+    const res = await deleteElementsByAuthor(boardId, user, {
+      userId: body.userId,
+      email: body.email,
+    });
+    if (!res.ok) {
+      return NextResponse.json({ error: res.error }, { status: 403 });
+    }
+    if (res.deletedIds && res.deletedIds.length > 0) {
+      realtimeHub.broadcast(
+        boardId,
+        { type: "element:delete", senderId, elementIds: res.deletedIds },
+        senderId
+      );
+    }
+    return NextResponse.json({ ok: true, deletedIds: res.deletedIds ?? [] });
   }
 
   return NextResponse.json({ error: "Acción no soportada" }, { status: 400 });

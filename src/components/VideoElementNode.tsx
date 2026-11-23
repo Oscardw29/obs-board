@@ -16,16 +16,21 @@ export const VideoElementNode: React.FC<VideoElementNodeProps> = ({
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const lastTriggerRef = useRef<string | undefined>(undefined);
+  const prevVisibleRef = useRef<boolean>(element.visible);
+  const endedTriggeredRef = useRef<boolean>(false);
   const [locallyEndedHidden, setLocallyEndedHidden] = useState(false);
 
   const isPlaying = element.playing ?? true;
-  const isLoop = element.loop ?? false;
+  // Auto-hide and loop are mutually exclusive: if autoHideOnEnd is enabled, never loop
+  const isLoop = element.autoHideOnEnd ? false : (element.loop ?? false);
   const isMuted =
-    mode === "thumbnail" ? true : (element.muted ?? false);
+    mode === "thumbnail" || !element.visible
+      ? true
+      : (element.muted ?? false);
   const volume = Math.min(1, Math.max(0, element.volume ?? 0.85));
   const objectFit = element.objectFit ?? "contain";
 
-  // Sync volume & mute
+  // Sync volume, mute & loop
   useEffect(() => {
     const vid = videoRef.current;
     if (!vid) return;
@@ -34,64 +39,98 @@ export const VideoElementNode: React.FC<VideoElementNodeProps> = ({
     vid.loop = isLoop;
   }, [volume, isMuted, isLoop]);
 
-  // Handle explicit re-trigger from 0:00
+  // Handle explicit re-trigger from 0:00 or visibility transition false -> true
   useEffect(() => {
     if (mode === "thumbnail") return;
     const vid = videoRef.current;
     if (!vid) return;
 
     const triggerChanged =
-      element.triggerId && element.triggerId !== lastTriggerRef.current;
+      Boolean(element.triggerId) && element.triggerId !== lastTriggerRef.current;
+    const becameVisible = !prevVisibleRef.current && element.visible;
+    prevVisibleRef.current = element.visible;
 
-    if (triggerChanged) {
-      lastTriggerRef.current = element.triggerId;
-      setLocallyEndedHidden(false);
-      try {
-        vid.currentTime = 0;
-      } catch {
-        // Metadata may not be loaded yet
-      }
-      if (isPlaying) {
-        const playPromise = vid.play();
-        if (playPromise) {
-          playPromise.catch(() => {
-            // Browser autoplay policy fallback when previewed in desktop tab without user gesture
-            vid.muted = true;
-            void vid.play().catch(() => {});
-          });
-        }
-      }
-      return;
-    }
-
-    if (isPlaying) {
-      setLocallyEndedHidden(false);
-      const playPromise = vid.play();
-      if (playPromise) {
-        playPromise.catch(() => {
+    const playSafe = () => {
+      const p = vid.play();
+      if (p) {
+        p.catch(() => {
           vid.muted = true;
           void vid.play().catch(() => {});
         });
       }
+    };
+
+    if (triggerChanged || becameVisible) {
+      lastTriggerRef.current = element.triggerId;
+      endedTriggeredRef.current = false;
+      setLocallyEndedHidden(false);
+
+      const restartAndPlay = () => {
+        try {
+          vid.currentTime = 0;
+        } catch {
+          // ignore
+        }
+        if (isPlaying) playSafe();
+      };
+
+      if (vid.readyState >= 1) {
+        restartAndPlay();
+      } else {
+        const onMeta = () => {
+          vid.removeEventListener("loadedmetadata", onMeta);
+          restartAndPlay();
+        };
+        vid.addEventListener("loadedmetadata", onMeta);
+        if (isPlaying) playSafe();
+        return () => vid.removeEventListener("loadedmetadata", onMeta);
+      }
+      return;
+    }
+
+    if (!element.visible) {
+      vid.pause();
+      return;
+    }
+
+    if (isPlaying && !locallyEndedHidden) {
+      playSafe();
     } else {
       vid.pause();
     }
-  }, [element.triggerId, isPlaying, mode, element.visible]);
+  }, [
+    element.triggerId,
+    isPlaying,
+    mode,
+    element.visible,
+    locallyEndedHidden,
+  ]);
 
-  // Reset local hide when element becomes visible again
-  useEffect(() => {
-    if (element.visible) {
-      setLocallyEndedHidden(false);
-    }
-  }, [element.visible, element.triggerId]);
-
-  const handleEnded = () => {
-    if (!isLoop && element.autoHideOnEnd) {
-      if (mode === "obs") {
-        setLocallyEndedHidden(true);
-      } else if (mode === "editor") {
-        onAutoHide?.(element.id);
+  const finishPlayback = () => {
+    if (isLoop || !element.autoHideOnEnd || endedTriggeredRef.current) return;
+    endedTriggeredRef.current = true;
+    const vid = videoRef.current;
+    if (vid) {
+      vid.pause();
+      try {
+        vid.currentTime = 0;
+      } catch {
+        // ignore
       }
+    }
+    if (mode === "obs") {
+      setLocallyEndedHidden(true);
+    } else if (mode === "editor") {
+      onAutoHide?.(element.id);
+    }
+  };
+
+  const handleTimeUpdate = () => {
+    if (isLoop || !element.autoHideOnEnd) return;
+    const vid = videoRef.current;
+    if (!vid || !Number.isFinite(vid.duration) || vid.duration <= 0) return;
+    if (vid.ended || vid.currentTime >= vid.duration - 0.05) {
+      finishPlayback();
     }
   };
 
@@ -104,11 +143,12 @@ export const VideoElementNode: React.FC<VideoElementNodeProps> = ({
       ref={videoRef}
       src={element.src}
       playsInline
-      autoPlay={mode !== "thumbnail" && isPlaying}
+      autoPlay={mode !== "thumbnail" && isPlaying && element.visible}
       loop={isLoop}
       muted={isMuted}
       preload="auto"
-      onEnded={handleEnded}
+      onEnded={finishPlayback}
+      onTimeUpdate={handleTimeUpdate}
       draggable={false}
       style={{
         width: "100%",

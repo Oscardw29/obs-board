@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { nanoid } from "nanoid";
 import { connectBoardRealtime } from "@/lib/client-realtime";
 import {
@@ -28,11 +28,15 @@ export const ObsStageClient: React.FC<ObsStageClientProps> = ({
 }) => {
   const clientId = useMemo(() => `obs_${nanoid(10)}`, []);
   const [elements, setElements] = useState<BoardElement[]>(initialElements);
-  const [liveDrafts, setLiveDrafts] = useState<Record<string, BoardElement>>(
-    {}
-  );
+  const [liveDrafts, setLiveDrafts] = useState<
+    Record<string, { element: BoardElement; receivedAt: number }>
+  >({});
   const [scale, setScale] = useState(1);
+
   const hadDisconnectRef = useRef(false);
+  const lastHashRef = useRef<string>("");
+  const finalizedDraftsRef = useRef<Map<string, number>>(new Map());
+  const strokeSeqRef = useRef<Map<string, number>>(new Map());
 
   // Enforce strict transparent background on html & body for OBS Browser Source
   useEffect(() => {
@@ -42,7 +46,7 @@ export const ObsStageClient: React.FC<ObsStageClientProps> = ({
     document.body.style.overflow = "hidden";
   }, []);
 
-  // Scale 1920x1080 stage cleanly to match OBS Browser Source size (exact 1.0 at 1920x1080)
+  // Scale 1920x1080 stage cleanly to match OBS Browser Source size
   useEffect(() => {
     const updateScale = () => {
       const sx = window.innerWidth / stageWidth;
@@ -54,18 +58,25 @@ export const ObsStageClient: React.FC<ObsStageClientProps> = ({
     return () => window.removeEventListener("resize", updateScale);
   }, [stageWidth, stageHeight]);
 
-  // Real-time sync with automatic snapshot resync after reconnects
-  useEffect(() => {
-    const resyncSnapshot = async () => {
+  const resyncSnapshot = useCallback(
+    async (force = false) => {
       try {
+        const hashParam =
+          !force && lastHashRef.current
+            ? `&hash=${encodeURIComponent(lastHashRef.current)}`
+            : "";
         const res = await fetch(
-          `/api/boards/${encodeURIComponent(boardId)}/obs?token=${encodeURIComponent(obsToken)}`,
+          `/api/boards/${encodeURIComponent(boardId)}/obs?token=${encodeURIComponent(obsToken)}${hashParam}`,
           { cache: "no-store" }
         );
         if (!res.ok) return;
         const data = (await res.json()) as {
+          unchanged?: boolean;
+          hash?: string;
           board?: { elements: BoardElement[] };
         };
+        if (data.hash) lastHashRef.current = data.hash;
+        if (data.unchanged) return;
         if (data.board?.elements) {
           setElements(data.board.elements);
           setLiveDrafts({});
@@ -73,6 +84,24 @@ export const ObsStageClient: React.FC<ObsStageClientProps> = ({
       } catch {
         // Ignore transient network errors
       }
+    },
+    [boardId, obsToken]
+  );
+
+  // Real-time sync + snapshot reconciliation
+  useEffect(() => {
+    const markFinalized = (id: string) => {
+      finalizedDraftsRef.current.set(id, Date.now());
+    };
+
+    const isRecentlyFinalized = (id: string) => {
+      const ts = finalizedDraftsRef.current.get(id);
+      if (!ts) return false;
+      if (Date.now() - ts > 30000) {
+        finalizedDraftsRef.current.delete(id);
+        return false;
+      }
+      return true;
     };
 
     const conn = connectBoardRealtime({
@@ -84,15 +113,17 @@ export const ObsStageClient: React.FC<ObsStageClientProps> = ({
           hadDisconnectRef.current = true;
         } else if (status === "connected" && hadDisconnectRef.current) {
           hadDisconnectRef.current = false;
-          void resyncSnapshot();
+          void resyncSnapshot(true);
         }
       },
       onEvent: (event: RealtimeEvent) => {
         switch (event.type) {
           case "elements:replace":
             setElements(event.elements);
+            setLiveDrafts({});
             break;
           case "element:upsert":
+            markFinalized(event.element.id);
             setElements((prev) => {
               const exists = prev.some((e) => e.id === event.element.id);
               if (exists) {
@@ -109,6 +140,25 @@ export const ObsStageClient: React.FC<ObsStageClientProps> = ({
               return copy;
             });
             break;
+          case "elements:upsertMany":
+            for (const el of event.elements) markFinalized(el.id);
+            setElements((prev) => {
+              const map = new Map(prev.map((e) => [e.id, e]));
+              for (const el of event.elements) map.set(el.id, el);
+              return Array.from(map.values());
+            });
+            setLiveDrafts((prev) => {
+              const copy = { ...prev };
+              let changed = false;
+              for (const el of event.elements) {
+                if (copy[el.id]) {
+                  delete copy[el.id];
+                  changed = true;
+                }
+              }
+              return changed ? copy : prev;
+            });
+            break;
           case "element:patch":
             setElements((prev) =>
               prev.map((e) =>
@@ -116,18 +166,60 @@ export const ObsStageClient: React.FC<ObsStageClientProps> = ({
               )
             );
             break;
-          case "element:delete": {
-            const set = new Set(event.elementIds);
-            setElements((prev) => prev.filter((e) => !set.has(e.id)));
+          case "elements:batchPatch": {
+            const pMap = new Map(
+              event.patches.map((p) => [p.elementId, p.patch])
+            );
+            setElements((prev) =>
+              prev.map((e) => {
+                const p = pMap.get(e.id);
+                return p ? { ...e, ...p } : e;
+              })
+            );
             break;
           }
-          case "stroke:live":
+          case "element:delete": {
+            const set = new Set(event.elementIds);
+            for (const id of event.elementIds) markFinalized(id);
+            setElements((prev) => prev.filter((e) => !set.has(e.id)));
+            setLiveDrafts((prev) => {
+              const copy = { ...prev };
+              let changed = false;
+              for (const id of event.elementIds) {
+                if (copy[id]) {
+                  delete copy[id];
+                  changed = true;
+                }
+              }
+              return changed ? copy : prev;
+            });
+            break;
+          }
+          case "member:kicked": {
+            if (event.deletedElementIds?.length) {
+              const set = new Set(event.deletedElementIds);
+              setElements((prev) => prev.filter((e) => !set.has(e.id)));
+            }
+            break;
+          }
+          case "stroke:live": {
+            if (isRecentlyFinalized(event.element.id)) return;
+            if (typeof event.seq === "number") {
+              const prevSeq = strokeSeqRef.current.get(event.element.id) ?? -1;
+              if (event.seq <= prevSeq) return;
+              strokeSeqRef.current.set(event.element.id, event.seq);
+            }
             setLiveDrafts((prev) => ({
               ...prev,
-              [event.element.id]: event.element,
+              [event.element.id]: {
+                element: event.element,
+                receivedAt: Date.now(),
+              },
             }));
             break;
+          }
           case "stroke:end":
+            markFinalized(event.elementId);
             setLiveDrafts((prev) => {
               if (!prev[event.elementId]) return prev;
               const copy = { ...prev };
@@ -165,10 +257,42 @@ export const ObsStageClient: React.FC<ObsStageClientProps> = ({
       },
     });
 
+    // Sweep stale liveDrafts (> 5s old) every 2s so unfinished strokes never stick
+    const draftSweepTimer = setInterval(() => {
+      const cutoff = Date.now() - 5000;
+      setLiveDrafts((prev) => {
+        let changed = false;
+        const next: Record<string, { element: BoardElement; receivedAt: number }> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          if (v.receivedAt >= cutoff) {
+            next[k] = v;
+          } else {
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+    }, 2000);
+
+    // Periodic lightweight hash reconciliation (every 12s)
+    const reconcileTimer = setInterval(() => {
+      void resyncSnapshot(false);
+    }, 12000);
+
+    const onVisChange = () => {
+      if (document.visibilityState === "visible") {
+        void resyncSnapshot(false);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisChange);
+
     return () => {
+      clearInterval(draftSweepTimer);
+      clearInterval(reconcileTimer);
+      document.removeEventListener("visibilitychange", onVisChange);
       conn.close();
     };
-  }, [boardId, clientId, obsToken]);
+  }, [boardId, clientId, obsToken, resyncSnapshot]);
 
   return (
     <div
@@ -190,7 +314,7 @@ export const ObsStageClient: React.FC<ObsStageClientProps> = ({
           <StageElement key={el.id} element={el} mode="obs" />
         ))}
         {Object.values(liveDrafts).map((draft) => (
-          <StageElement key={draft.id} element={draft} mode="obs" />
+          <StageElement key={draft.element.id} element={draft.element} mode="obs" />
         ))}
       </div>
     </div>

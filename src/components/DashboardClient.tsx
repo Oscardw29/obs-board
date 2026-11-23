@@ -2,7 +2,6 @@
 
 import React, { useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import {
   Check,
   Copy,
@@ -24,9 +23,11 @@ import {
   type BoardSummary,
   type User,
 } from "@/types/board";
+import { BrandLogo } from "./BrandLogo";
 import { MediaManagerModal } from "./MediaManagerModal";
 import { ShareModal } from "./ShareModal";
 import { StageElement } from "./StageElement";
+import { ConfirmModal } from "./ui/ConfirmModal";
 
 interface DashboardClientProps {
   user: User;
@@ -36,9 +37,8 @@ interface DashboardClientProps {
 }
 
 function BoardThumbnail({ board }: { board: BoardSummary }) {
-  // Renders the 1920x1080 board scaled cleanly into a 16:9 card thumbnail
   return (
-    <div className="relative w-full aspect-video obs-checkerboard overflow-hidden rounded-t-xl border-b border-studio-800">
+    <div className="relative w-full aspect-video obs-checkerboard overflow-hidden rounded-t-2xl border-b border-white/[0.07]">
       <div
         className="absolute top-0 left-0 origin-top-left pointer-events-none"
         style={{
@@ -54,16 +54,16 @@ function BoardThumbnail({ board }: { board: BoardSummary }) {
       {board.previewElements.length === 0 && (
         <div className="absolute inset-0 flex flex-col items-center justify-center text-zinc-500/70 gap-1">
           <Layers className="w-6 h-6" />
-          <span className="text-[11px]">Tablero vacío • 1920×1080</span>
+          <span className="text-[11px]">Tablero vacío · 1920×1080</span>
         </div>
       )}
-      <div className="absolute top-2 left-2 flex items-center gap-1.5">
+      <div className="absolute top-2.5 left-2.5 flex items-center gap-1.5">
         <span
           className={`px-2 py-0.5 rounded-full text-[10px] font-medium backdrop-blur-md border ${
             board.myRole === "owner"
-              ? "bg-indigo-500/20 text-indigo-200 border-indigo-400/30"
+              ? "bg-sky-500/20 text-sky-200 border-sky-400/35"
               : board.myRole === "editor"
-                ? "bg-emerald-500/20 text-emerald-200 border-emerald-400/30"
+                ? "bg-emerald-500/20 text-emerald-200 border-emerald-400/35"
                 : "bg-zinc-800/80 text-zinc-300 border-zinc-600/40"
           }`}
         >
@@ -84,7 +84,6 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
   initialBoards,
   initialMediaCount,
 }) => {
-  const router = useRouter();
   const [boards, setBoards] = useState<BoardSummary[]>(initialBoards);
   const [mediaCount, setMediaCount] = useState(initialMediaCount);
   const [filter, setFilter] = useState<"all" | "mine" | "shared">("all");
@@ -94,6 +93,8 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
   const [newBoardTitle, setNewBoardTitle] = useState("");
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [shareTarget, setShareTarget] = useState<BoardSummary | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<BoardSummary | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const [mediaModalOpen, setMediaModalOpen] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -107,7 +108,7 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          title: newBoardTitle.trim() || `Tablero OBS ${boards.length + 1}`,
+          title: newBoardTitle.trim() || `Tablero OBoardS ${boards.length + 1}`,
         }),
       });
       const data = (await res.json().catch(() => ({}))) as {
@@ -153,21 +154,18 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
     }
   };
 
-  const handleDelete = async (board: BoardSummary) => {
-    if (
-      !window.confirm(
-        `¿Eliminar el tablero "${board.title}"? Esta acción no se puede deshacer.`
-      )
-    ) {
-      return;
-    }
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget) return;
+    setDeleting(true);
     setActionError(null);
     try {
-      const res = await fetch(`/api/boards/${encodeURIComponent(board.id)}`, {
-        method: "DELETE",
-      });
+      const res = await fetch(
+        `/api/boards/${encodeURIComponent(deleteTarget.id)}`,
+        { method: "DELETE" }
+      );
       if (res.ok) {
-        setBoards((prev) => prev.filter((b) => b.id !== board.id));
+        setBoards((prev) => prev.filter((b) => b.id !== deleteTarget.id));
+        setDeleteTarget(null);
       } else {
         const data = (await res.json().catch(() => ({}))) as {
           error?: string;
@@ -178,6 +176,8 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
       }
     } catch {
       setActionError("Error de conexión al eliminar el tablero.");
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -212,18 +212,16 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
   return (
     <div className="min-h-screen bg-studio-950 text-zinc-100 flex flex-col">
       {/* Top Navbar */}
-      <header className="sticky top-0 z-30 border-b border-studio-800/80 bg-studio-950/85 backdrop-blur-md">
+      <header className="sticky top-0 z-30 border-b border-white/[0.07] bg-studio-950/90 backdrop-blur-md">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 to-fuchsia-600 flex items-center justify-center shadow-lg shadow-indigo-600/20">
-              <MonitorPlay className="w-5 h-5 text-white" />
+            <div className="w-9 h-9 rounded-xl bg-sky-500/15 border border-sky-400/30 flex items-center justify-center shadow-[0_0_18px_rgba(56,189,248,0.2)]">
+              <MonitorPlay className="w-5 h-5 text-sky-400" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
-                <span className="font-bold text-base tracking-tight text-white">
-                  OBS<span className="text-indigo-400">Board</span>
-                </span>
-                <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-studio-850 border border-studio-700 text-zinc-300">
+              <div className="flex items-center gap-2.5">
+                <BrandLogo size="md" />
+                <span className="hidden sm:inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-medium bg-studio-900 border border-white/[0.08] text-zinc-300">
                   <Radio className="w-2.5 h-2.5 text-emerald-400" />
                   {mode === "cloud" ? "Nube" : "Local OBS"}
                 </span>
@@ -238,11 +236,11 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
             <button
               type="button"
               onClick={() => setMediaModalOpen(true)}
-              className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-studio-900 hover:bg-studio-800 border border-studio-700 text-zinc-200 text-xs font-medium transition"
+              className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-studio-900 hover:bg-studio-850 border border-white/[0.09] text-zinc-200 text-xs font-medium transition-colors"
             >
-              <Film className="w-4 h-4 text-fuchsia-400" />
+              <Film className="w-4 h-4 text-sky-400" />
               <span className="hidden sm:inline">Biblioteca Media</span>
-              <span className="px-1.5 py-0.5 rounded-md bg-studio-800 text-[10px] text-zinc-300">
+              <span className="px-1.5 py-0.5 rounded-md bg-studio-800 text-[10px] font-mono tabular-nums text-zinc-300">
                 {mediaCount}
               </span>
             </button>
@@ -253,13 +251,13 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
                 setCreateError(null);
                 setNewBoardOpen(true);
               }}
-              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition shadow-lg shadow-indigo-600/25"
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold transition-colors shadow-lg shadow-sky-600/25"
             >
               <Plus className="w-4 h-4" />
               <span>Nuevo tablero</span>
             </button>
 
-            <div className="h-6 w-px bg-studio-800 mx-1 hidden sm:block" />
+            <div className="h-6 w-px bg-white/[0.08] mx-1 hidden sm:block" />
 
             <div className="flex items-center gap-2">
               <div
@@ -281,7 +279,8 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
                 type="button"
                 onClick={handleLogout}
                 title="Cerrar sesión"
-                className="p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-studio-850 transition"
+                aria-label="Cerrar sesión"
+                className="p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-studio-850 transition-colors"
               >
                 <LogOut className="w-4 h-4" />
               </button>
@@ -308,7 +307,7 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
         {/* Toolbar row */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div>
-            <h1 className="text-2xl font-bold text-white tracking-tight">
+            <h1 className="text-2xl font-bold text-white tracking-tight text-balance">
               Tus tableros
             </h1>
             <p className="text-sm text-zinc-400 mt-0.5">
@@ -324,12 +323,12 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
                 type="text"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                placeholder="Buscar tablero..."
-                className="rounded-xl bg-studio-900 border border-studio-700 pl-9 pr-3 py-2 text-xs text-white placeholder:text-zinc-500 focus:outline-none focus:border-indigo-500 w-52"
+                placeholder="Buscar tablero…"
+                className="rounded-xl bg-studio-900 border border-white/[0.09] pl-9 pr-3 py-2 text-xs text-white placeholder:text-zinc-500 focus:outline-none focus:border-sky-400 w-52"
               />
             </div>
 
-            <div className="flex rounded-xl bg-studio-900 border border-studio-800 p-1 text-xs">
+            <div className="flex rounded-xl bg-studio-900 border border-white/[0.08] p-1 text-xs">
               {(
                 [
                   ["all", "Todos"],
@@ -341,7 +340,7 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
                   key={key}
                   type="button"
                   onClick={() => setFilter(key)}
-                  className={`px-3 py-1 rounded-lg transition ${
+                  className={`px-3 py-1 rounded-lg transition-colors ${
                     filter === key
                       ? "bg-studio-800 text-white font-medium"
                       : "text-zinc-400 hover:text-zinc-200"
@@ -356,8 +355,8 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
 
         {/* Boards Grid */}
         {visibleBoards.length === 0 ? (
-          <div className="rounded-2xl border border-dashed border-studio-700 bg-studio-900/40 py-20 px-6 text-center space-y-4">
-            <div className="w-12 h-12 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center mx-auto text-indigo-400">
+          <div className="rounded-2xl border border-dashed border-white/[0.12] bg-studio-900/40 py-20 px-6 text-center space-y-4">
+            <div className="w-12 h-12 rounded-2xl bg-sky-500/10 border border-sky-400/20 flex items-center justify-center mx-auto text-sky-400">
               <Layers className="w-6 h-6" />
             </div>
             <div>
@@ -377,7 +376,7 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
                 setCreateError(null);
                 setNewBoardOpen(true);
               }}
-              className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition"
+              className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold transition-colors"
             >
               <Plus className="w-4 h-4" />
               <span>Crear mi primer tablero</span>
@@ -388,7 +387,7 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
             {visibleBoards.map((board) => (
               <div
                 key={board.id}
-                className="group rounded-2xl bg-studio-900 border border-studio-800 hover:border-indigo-500/50 transition-all shadow-lg flex flex-col overflow-hidden"
+                className="group rounded-2xl bg-studio-900 border border-white/[0.08] hover:border-sky-400/50 transition-colors shadow-lg flex flex-col overflow-hidden"
               >
                 <Link href={`/board/${board.id}`} className="block">
                   <BoardThumbnail board={board} />
@@ -398,14 +397,14 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
                   <div>
                     <Link
                       href={`/board/${board.id}`}
-                      className="text-sm font-semibold text-white group-hover:text-indigo-300 transition line-clamp-1"
+                      className="text-sm font-semibold text-white group-hover:text-sky-300 transition-colors line-clamp-1"
                     >
                       {board.title}
                     </Link>
-                    <div className="flex items-center gap-3 mt-1.5 text-[11px] text-zinc-500">
+                    <div className="flex items-center gap-3 mt-1.5 text-[11px] text-zinc-500 font-mono tabular-nums">
                       <span className="inline-flex items-center gap-1">
                         <Layers className="w-3 h-3" />
-                        {board.elementCount} elementos
+                        {board.elementCount} elem.
                       </span>
                       <span className="inline-flex items-center gap-1">
                         <Users className="w-3 h-3" />
@@ -420,10 +419,10 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2 pt-2 border-t border-studio-800/80">
+                  <div className="flex items-center gap-2 pt-2 border-t border-white/[0.06]">
                     <Link
                       href={`/board/${board.id}`}
-                      className="flex-1 text-center py-1.5 px-3 rounded-lg bg-indigo-600/90 hover:bg-indigo-500 text-white text-xs font-medium transition"
+                      className="flex-1 text-center py-1.5 px-3 rounded-lg bg-sky-600/90 hover:bg-sky-500 text-white text-xs font-medium transition-colors"
                     >
                       Abrir editor
                     </Link>
@@ -432,7 +431,7 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
                       type="button"
                       onClick={() => handleCopyObs(board)}
                       title="Copiar URL transparente para OBS Studio"
-                      className="inline-flex items-center gap-1 py-1.5 px-2.5 rounded-lg bg-studio-850 hover:bg-studio-800 border border-studio-700 text-zinc-200 text-xs transition"
+                      className="inline-flex items-center gap-1 py-1.5 px-2.5 rounded-lg bg-studio-850 hover:bg-studio-800 border border-white/[0.08] text-zinc-200 text-xs transition-colors"
                     >
                       {copiedId === board.id ? (
                         <>
@@ -441,7 +440,7 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
                         </>
                       ) : (
                         <>
-                          <Copy className="w-3.5 h-3.5 text-indigo-400" />
+                          <Copy className="w-3.5 h-3.5 text-sky-400" />
                           <span>OBS</span>
                         </>
                       )}
@@ -451,7 +450,8 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
                       type="button"
                       onClick={() => setShareTarget(board)}
                       title="Compartir e invitar colaboradores"
-                      className="p-1.5 rounded-lg bg-studio-850 hover:bg-studio-800 border border-studio-700 text-zinc-300 hover:text-white transition"
+                      aria-label="Compartir tablero"
+                      className="p-1.5 rounded-lg bg-studio-850 hover:bg-studio-800 border border-white/[0.08] text-zinc-300 hover:text-white transition-colors"
                     >
                       <Share2 className="w-3.5 h-3.5" />
                     </button>
@@ -460,7 +460,8 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
                       type="button"
                       onClick={() => handleDuplicate(board)}
                       title="Duplicar tablero"
-                      className="p-1.5 rounded-lg bg-studio-850 hover:bg-studio-800 border border-studio-700 text-zinc-300 hover:text-white transition"
+                      aria-label="Duplicar tablero"
+                      className="p-1.5 rounded-lg bg-studio-850 hover:bg-studio-800 border border-white/[0.08] text-zinc-300 hover:text-white transition-colors"
                     >
                       <CopyPlus className="w-3.5 h-3.5" />
                     </button>
@@ -468,9 +469,10 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
                     {board.myRole === "owner" && (
                       <button
                         type="button"
-                        onClick={() => handleDelete(board)}
+                        onClick={() => setDeleteTarget(board)}
                         title="Eliminar tablero"
-                        className="p-1.5 rounded-lg bg-studio-850 hover:bg-rose-500/15 border border-studio-700 hover:border-rose-500/40 text-zinc-400 hover:text-rose-400 transition"
+                        aria-label="Eliminar tablero"
+                        className="p-1.5 rounded-lg bg-studio-850 hover:bg-rose-500/15 border border-white/[0.08] hover:border-rose-500/40 text-zinc-400 hover:text-rose-400 transition-colors"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
@@ -486,7 +488,7 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
       {/* New Board Modal */}
       {newBoardOpen && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4 overscroll-contain"
           onClick={() => {
             setCreateError(null);
             setNewBoardOpen(false);
@@ -495,11 +497,11 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
           <form
             onSubmit={handleCreateBoard}
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-md rounded-2xl bg-studio-900 border border-studio-700 p-5 shadow-2xl space-y-4"
+            className="w-full max-w-md rounded-2xl bg-studio-900 border border-white/[0.1] p-5 shadow-2xl space-y-4 animate-modal-enter"
           >
             <div>
               <h2 className="text-base font-semibold text-white">
-                Crear nuevo tablero OBS
+                Crear nuevo tablero OBoardS
               </h2>
               <p className="text-xs text-zinc-400 mt-0.5">
                 Se creará un lienzo 1920×1080 transparente listo para colaborar y
@@ -516,8 +518,8 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
               type="text"
               value={newBoardTitle}
               onChange={(e) => setNewBoardTitle(e.target.value)}
-              placeholder="Ej. Just Chatting, Torneo, Pizarra Clips..."
-              className="w-full rounded-xl bg-studio-950 border border-studio-700 px-3.5 py-2.5 text-sm text-white placeholder:text-zinc-500 focus:outline-none focus:border-indigo-500"
+              placeholder="Ej. Just Chatting, Torneo, Pizarra Clips…"
+              className="w-full rounded-xl bg-studio-950 border border-white/[0.09] px-3.5 py-2.5 text-sm text-white placeholder:text-zinc-500 focus:outline-none focus:border-sky-400"
             />
             <div className="flex justify-end gap-2">
               <button
@@ -526,16 +528,16 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
                   setCreateError(null);
                   setNewBoardOpen(false);
                 }}
-                className="px-4 py-2 rounded-xl bg-studio-850 hover:bg-studio-800 text-xs text-zinc-300 transition"
+                className="px-4 py-2 rounded-xl bg-studio-850 hover:bg-studio-800 text-xs text-zinc-300 transition-colors"
               >
                 Cancelar
               </button>
               <button
                 type="submit"
                 disabled={creating}
-                className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-xs font-semibold text-white transition"
+                className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-xs font-semibold text-white transition-colors"
               >
-                {creating ? "Creando..." : "Crear y abrir"}
+                {creating ? "Creando…" : "Crear y abrir"}
               </button>
             </div>
           </form>
@@ -572,6 +574,18 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
           }}
         />
       )}
+
+      {/* Delete Board Confirm Modal */}
+      <ConfirmModal
+        open={Boolean(deleteTarget)}
+        title={`¿Eliminar "${deleteTarget?.title ?? ""}"?`}
+        description="Se eliminará el tablero y todos sus elementos permanentemente. Esta acción no se puede deshacer."
+        confirmLabel="Eliminar tablero"
+        destructive
+        loading={deleting}
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={handleConfirmDelete}
+      />
 
       {/* Media Library Modal */}
       <MediaManagerModal
