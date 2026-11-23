@@ -3,10 +3,13 @@ import { NextResponse, type NextRequest } from "next/server";
 
 export async function middleware(request: NextRequest) {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  const key =
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
   // In local mode (no Supabase env vars), pass through untouched
-  if (!url || !anonKey) {
+  if (!url || !key) {
     return NextResponse.next();
   }
 
@@ -14,7 +17,7 @@ export async function middleware(request: NextRequest) {
     request,
   });
 
-  const supabase = createServerClient(url, anonKey, {
+  const supabase = createServerClient(url, key, {
     cookies: {
       getAll() {
         return request.cookies.getAll();

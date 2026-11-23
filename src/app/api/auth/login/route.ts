@@ -37,6 +37,16 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: true });
     }
 
+    if (process.env.VERCEL) {
+      return NextResponse.json(
+        {
+          error:
+            "Faltan las variables de Supabase en Vercel (NEXT_PUBLIC_SUPABASE_URL y NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY). Agrégalas en Vercel -> Settings -> Environment Variables y haz Redeploy.",
+        },
+        { status: 500 }
+      );
+    }
+
     const result = await loginLocalUser({ email, password });
     if (result.error || !result.user) {
       return NextResponse.json(

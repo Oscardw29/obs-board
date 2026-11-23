@@ -23,14 +23,22 @@ export default function LoginPage() {
   const [info, setInfo] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [mode, setMode] = useState<"local" | "cloud">("local");
+  const [missingCloudEnv, setMissingCloudEnv] = useState(false);
 
   useEffect(() => {
     fetch("/api/auth/me")
       .then((r) => r.json())
-      .then((data: { user?: unknown; mode?: "local" | "cloud" }) => {
-        if (data.mode) setMode(data.mode);
-        if (data.user) router.replace("/");
-      })
+      .then(
+        (data: {
+          user?: unknown;
+          mode?: "local" | "cloud";
+          missingCloudEnv?: boolean;
+        }) => {
+          if (data.mode) setMode(data.mode);
+          if (data.missingCloudEnv) setMissingCloudEnv(true);
+          if (data.user) router.replace("/");
+        }
+      )
       .catch(() => {});
   }, [router]);
 
@@ -63,8 +71,7 @@ export default function LoginPage() {
         setTab("login");
         return;
       }
-      router.push("/");
-      router.refresh();
+      window.location.href = "/";
     } catch {
       setError("Error de conexión con el servidor.");
     } finally {
@@ -216,6 +223,18 @@ export default function LoginPage() {
             </button>
           </div>
 
+          {missingCloudEnv && (
+            <div className="mb-4 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3.5 py-2.5 text-xs text-amber-200 leading-relaxed">
+              Esta app está en Vercel pero no detecta las variables de Supabase (
+              <code className="text-amber-100">NEXT_PUBLIC_SUPABASE_URL</code> y{" "}
+              <code className="text-amber-100">
+                NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
+              </code>
+              ). Verifica <strong>Vercel → Settings → Environment Variables</strong>{" "}
+              y haz <strong>Redeploy</strong>.
+            </div>
+          )}
+
           {error && (
             <div className="mb-4 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3.5 py-2.5 text-xs text-rose-300">
               {error}
@@ -305,7 +324,7 @@ export default function LoginPage() {
                 Continuar con Google
               </button>
             </div>
-          ) : (
+          ) : !missingCloudEnv ? (
             <div className="mt-5 pt-5 border-t border-studio-800 space-y-2.5">
               <button
                 type="button"
@@ -322,7 +341,7 @@ export default function LoginPage() {
                 cuentas adicionales para probar invitaciones.
               </p>
             </div>
-          )}
+          ) : null}
         </div>
       </div>
     </div>

@@ -1,14 +1,19 @@
 import { createServerClient } from "@supabase/ssr";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { cookies } from "next/headers";
+import {
+  getSupabasePublishableKey,
+  getSupabaseSecretKey,
+  getSupabaseUrl,
+} from "../config";
 
 export async function getSupabaseServerClient(): Promise<SupabaseClient | null> {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-  if (!url || !anonKey) return null;
+  const url = getSupabaseUrl();
+  const key = getSupabasePublishableKey();
+  if (!url || !key) return null;
 
   const cookieStore = await cookies();
-  return createServerClient(url, anonKey, {
+  return createServerClient(url, key, {
     cookies: {
       getAll() {
         return cookieStore.getAll();
@@ -33,11 +38,11 @@ export async function getSupabaseServerClient(): Promise<SupabaseClient | null> 
 }
 
 export function getSupabaseAdminClient(): SupabaseClient | null {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !serviceKey) return null;
+  const url = getSupabaseUrl();
+  const secretKey = getSupabaseSecretKey();
+  if (!url || !secretKey) return null;
 
-  return createClient(url, serviceKey, {
+  return createClient(url, secretKey, {
     auth: {
       persistSession: false,
       autoRefreshToken: false,
