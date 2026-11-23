@@ -1,0 +1,20 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+
+# next.js
+/.next/
+/out/
+
+# local data & uploads
+/.data/
+
+# env
+.env
+.env*.local
+
+# logs
+npm-debug.log*
+*.tsbuildinfo
+next-env.d.ts
