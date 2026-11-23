@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { nanoid } from "nanoid";
 import {
   STAGE_HEIGHT,
@@ -27,63 +28,132 @@ function safeTokenEqual(a: string, b: string): boolean {
   return crypto.timingSafeEqual(bufA, bufB);
 }
 
+/**
+ * Returns the server-side Supabase DB client.
+ * Prefers the admin (secret key) client after the route has ALREADY verified
+ * user identity via getCurrentUser(), while every function in this module
+ * enforces explicit owner/member/editor checks in code (defense-in-depth).
+ * Falls back to the user-scoped SSR client when SUPABASE_SECRET_KEY is absent.
+ */
+async function getCloudDbClient(): Promise<SupabaseClient | null> {
+  const admin = getSupabaseAdminClient();
+  if (admin) return admin;
+  return getSupabaseServerClient();
+}
+
+function formatSupabaseError(err: { code?: string; message: string }): string {
+  if (
+    err.code === "42P01" ||
+    err.code === "PGRST205" ||
+    err.message.includes("Could not find the table")
+  ) {
+    return "Faltan las tablas en Supabase. Ejecuta supabase/schema.sql en el SQL Editor de tu proyecto Supabase.";
+  }
+  if (
+    err.code === "42501" ||
+    err.message.toLowerCase().includes("row-level security")
+  ) {
+    return `Permiso denegado por RLS en Supabase (${err.message}). Verifica que ejecutaste supabase/schema.sql completo y configuraste SUPABASE_SECRET_KEY en Vercel.`;
+  }
+  return err.message;
+}
+
 // ============================================================================
 // BOARDS
 // ============================================================================
 
 export async function listBoardsForUser(user: User): Promise<BoardSummary[]> {
   if (isSupabaseConfigured()) {
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) return [];
 
-    const { data: boards } = await supabase
+    const emailLower = user.email.toLowerCase();
+
+    // Fetch boards owned by user OR where user's email is an invited member
+    const { data: memberships } = await supabase
+      .from("board_members")
+      .select("board_id")
+      .ilike("email", emailLower);
+
+    const sharedBoardIds = (memberships ?? []).map((m) => m.board_id as string);
+
+    const { data: ownedBoards, error: ownedErr } = await supabase
       .from("boards")
       .select(
         "id, title, owner_id, owner_email, owner_name, obs_token, stage_width, stage_height, created_at, updated_at, board_members(id, email, role), board_elements(id, data, z_index, visible)"
       )
+      .eq("owner_id", user.id)
       .order("updated_at", { ascending: false });
 
-    if (!boards) return [];
+    if (ownedErr) {
+      console.error("[listBoardsForUser] ownedBoards error:", ownedErr);
+    }
 
-    return boards.map((b) => {
-      const members = (b.board_members ?? []) as Array<{
-        id: string;
-        email: string;
-        role: Exclude<BoardRole, "owner">;
-      }>;
-      const rawEls = (b.board_elements ?? []) as Array<{
-        data: BoardElement;
-        z_index: number;
-        visible: boolean;
-      }>;
-      const elements = rawEls
-        .map((e) => e.data)
-        .sort((a, c) => a.zIndex - c.zIndex);
-      const isOwner = b.owner_id === user.id;
-      const membership = members.find(
-        (m) => m.email.toLowerCase() === user.email.toLowerCase()
-      );
-      const myRole: BoardRole = isOwner
-        ? "owner"
-        : membership?.role ?? "viewer";
+    let sharedBoards: typeof ownedBoards = [];
+    if (sharedBoardIds.length > 0) {
+      const { data, error: sharedErr } = await supabase
+        .from("boards")
+        .select(
+          "id, title, owner_id, owner_email, owner_name, obs_token, stage_width, stage_height, created_at, updated_at, board_members(id, email, role), board_elements(id, data, z_index, visible)"
+        )
+        .in("id", sharedBoardIds)
+        .neq("owner_id", user.id)
+        .order("updated_at", { ascending: false });
+      if (sharedErr) {
+        console.error("[listBoardsForUser] sharedBoards error:", sharedErr);
+      }
+      sharedBoards = data ?? [];
+    }
 
-      return {
-        id: b.id,
-        title: b.title,
-        ownerId: b.owner_id,
-        ownerEmail: b.owner_email ?? "",
-        ownerName: b.owner_name ?? "Propietario",
-        obsToken: b.obs_token,
-        stageWidth: b.stage_width ?? STAGE_WIDTH,
-        stageHeight: b.stage_height ?? STAGE_HEIGHT,
-        myRole,
-        memberCount: members.length,
-        elementCount: elements.length,
-        previewElements: elements.filter((e) => e.visible).slice(0, 25),
-        createdAt: b.created_at,
-        updatedAt: b.updated_at,
-      };
+    const combined = [...(ownedBoards ?? []), ...(sharedBoards ?? [])];
+    const seen = new Set<string>();
+    const uniqueBoards = combined.filter((b) => {
+      if (seen.has(b.id)) return false;
+      seen.add(b.id);
+      return true;
     });
+
+    return uniqueBoards
+      .map((b) => {
+        const members = (b.board_members ?? []) as Array<{
+          id: string;
+          email: string;
+          role: Exclude<BoardRole, "owner">;
+        }>;
+        const rawEls = (b.board_elements ?? []) as Array<{
+          data: BoardElement;
+          z_index: number;
+          visible: boolean;
+        }>;
+        const elements = rawEls
+          .map((e) => e.data)
+          .sort((a, c) => a.zIndex - c.zIndex);
+        const isOwner = b.owner_id === user.id;
+        const membership = members.find(
+          (m) => m.email.toLowerCase() === emailLower
+        );
+        const myRole: BoardRole = isOwner
+          ? "owner"
+          : membership?.role ?? "viewer";
+
+        return {
+          id: b.id,
+          title: b.title,
+          ownerId: b.owner_id,
+          ownerEmail: b.owner_email ?? "",
+          ownerName: b.owner_name ?? "Propietario",
+          obsToken: b.obs_token,
+          stageWidth: b.stage_width ?? STAGE_WIDTH,
+          stageHeight: b.stage_height ?? STAGE_HEIGHT,
+          myRole,
+          memberCount: members.length,
+          elementCount: elements.length,
+          previewElements: elements.filter((e) => e.visible).slice(0, 25),
+          createdAt: b.created_at,
+          updatedAt: b.updated_at,
+        };
+      })
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
   const db = readLocalDb();
@@ -143,7 +213,7 @@ export async function createBoard(
   const obsToken = nanoid(24);
 
   if (isSupabaseConfigured()) {
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) throw new Error("Supabase no configurado");
 
     const { error } = await supabase.from("boards").insert({
@@ -158,7 +228,10 @@ export async function createBoard(
       created_at: now,
       updated_at: now,
     });
-    if (error) throw new Error(error.message);
+    if (error) {
+      console.error("[createBoard] Supabase insert error:", error);
+      throw new Error(formatSupabaseError(error));
+    }
 
     return {
       id,
@@ -218,13 +291,13 @@ export async function getUserBoardRole(
   user: User
 ): Promise<BoardRole | null> {
   if (isSupabaseConfigured()) {
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) return null;
     const { data: board } = await supabase
       .from("boards")
       .select("id, owner_id")
       .eq("id", boardId)
-      .single();
+      .maybeSingle();
     if (!board) return null;
     if (board.owner_id === user.id) return "owner";
 
@@ -232,8 +305,8 @@ export async function getUserBoardRole(
       .from("board_members")
       .select("role")
       .eq("board_id", boardId)
-      .ilike("email", user.email)
-      .single();
+      .ilike("email", user.email.toLowerCase())
+      .maybeSingle();
 
     return (member?.role as BoardRole | undefined) ?? null;
   }
@@ -259,14 +332,14 @@ export async function getBoardForUser(
   if (isSupabaseConfigured()) {
     const role = await getUserBoardRole(boardId, user);
     if (!role) return null;
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) return null;
 
     const { data: b } = await supabase
       .from("boards")
       .select("*")
       .eq("id", boardId)
-      .single();
+      .maybeSingle();
     if (!b) return null;
 
     const { data: memberRows } = await supabase
@@ -374,16 +447,14 @@ export async function getBoardForObs(
   if (!token) return null;
 
   if (isSupabaseConfigured()) {
-    const client =
-      getSupabaseAdminClient() ?? (await getSupabaseServerClient());
+    const client = await getCloudDbClient();
     if (!client) return null;
 
-    // Using RPC or admin client to verify OBS token safely
     const { data: b } = await client
       .from("boards")
       .select("id, title, obs_token, stage_width, stage_height")
       .eq("id", boardId)
-      .single();
+      .maybeSingle();
 
     if (!b || !safeTokenEqual(b.obs_token, token)) return null;
 
@@ -432,13 +503,13 @@ export async function updateBoardTitle(
   const now = new Date().toISOString();
 
   if (isSupabaseConfigured()) {
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) return { ok: false, error: "Supabase no disponible." };
     const { error } = await supabase
       .from("boards")
       .update({ title: clean, updated_at: now })
       .eq("id", boardId);
-    if (error) return { ok: false, error: error.message };
+    if (error) return { ok: false, error: formatSupabaseError(error) };
     return { ok: true, title: clean };
   }
 
@@ -461,10 +532,10 @@ export async function deleteBoard(
   }
 
   if (isSupabaseConfigured()) {
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) return { ok: false, error: "Supabase no disponible." };
     const { error } = await supabase.from("boards").delete().eq("id", boardId);
-    if (error) return { ok: false, error: error.message };
+    if (error) return { ok: false, error: formatSupabaseError(error) };
     return { ok: true };
   }
 
@@ -511,13 +582,13 @@ export async function regenerateObsToken(
   const now = new Date().toISOString();
 
   if (isSupabaseConfigured()) {
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) return { ok: false, error: "Supabase no disponible." };
     const { error } = await supabase
       .from("boards")
       .update({ obs_token: newToken, updated_at: now })
       .eq("id", boardId);
-    if (error) return { ok: false, error: error.message };
+    if (error) return { ok: false, error: formatSupabaseError(error) };
     return { ok: true, obsToken: newToken };
   }
 
@@ -556,25 +627,50 @@ export async function inviteBoardMember(
   const now = new Date().toISOString();
 
   if (isSupabaseConfigured()) {
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) return { error: "Supabase no disponible." };
+
+    const { data: existing } = await supabase
+      .from("board_members")
+      .select("*")
+      .eq("board_id", boardId)
+      .ilike("email", email)
+      .maybeSingle();
+
+    if (existing) {
+      const { data, error } = await supabase
+        .from("board_members")
+        .update({ role })
+        .eq("id", existing.id)
+        .select("*")
+        .single();
+      if (error) return { error: formatSupabaseError(error) };
+      return {
+        member: {
+          id: data.id,
+          boardId: data.board_id,
+          email: data.email,
+          userId: data.user_id ?? undefined,
+          name: data.name ?? undefined,
+          role: data.role,
+          invitedAt: data.invited_at,
+        },
+      };
+    }
 
     const { data, error } = await supabase
       .from("board_members")
-      .upsert(
-        {
-          id: `mem_${nanoid(12)}`,
-          board_id: boardId,
-          email,
-          role,
-          invited_at: now,
-        },
-        { onConflict: "board_id,email" }
-      )
+      .insert({
+        id: `mem_${nanoid(12)}`,
+        board_id: boardId,
+        email,
+        role,
+        invited_at: now,
+      })
       .select("*")
       .single();
 
-    if (error) return { error: error.message };
+    if (error) return { error: formatSupabaseError(error) };
     return {
       member: {
         id: data.id,
@@ -626,14 +722,14 @@ export async function removeBoardMember(
   }
 
   if (isSupabaseConfigured()) {
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) return { ok: false, error: "Supabase no disponible." };
     const { error } = await supabase
       .from("board_members")
       .delete()
       .eq("id", memberId)
       .eq("board_id", boardId);
-    if (error) return { ok: false, error: error.message };
+    if (error) return { ok: false, error: formatSupabaseError(error) };
     return { ok: true };
   }
 
@@ -667,7 +763,7 @@ export async function upsertElement(
   const nowIso = new Date().toISOString();
 
   if (isSupabaseConfigured()) {
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) return { ok: false, error: "Supabase no disponible." };
     const { error } = await supabase.from("board_elements").upsert({
       id: normalized.id,
@@ -677,7 +773,7 @@ export async function upsertElement(
       data: normalized,
       updated_at: nowIso,
     });
-    if (error) return { ok: false, error: error.message };
+    if (error) return { ok: false, error: formatSupabaseError(error) };
     await supabase
       .from("boards")
       .update({ updated_at: nowIso })
@@ -714,14 +810,14 @@ export async function patchElement(
   const nowIso = new Date().toISOString();
 
   if (isSupabaseConfigured()) {
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) return { ok: false, error: "Supabase no disponible." };
     const { data: existing } = await supabase
       .from("board_elements")
       .select("data")
       .eq("board_id", boardId)
       .eq("id", elementId)
-      .single();
+      .maybeSingle();
     if (!existing) return { ok: false, error: "Elemento no encontrado." };
     const updated: BoardElement = {
       ...(existing.data as BoardElement),
@@ -740,7 +836,7 @@ export async function patchElement(
       })
       .eq("board_id", boardId)
       .eq("id", elementId);
-    if (error) return { ok: false, error: error.message };
+    if (error) return { ok: false, error: formatSupabaseError(error) };
     await supabase
       .from("boards")
       .update({ updated_at: nowIso })
@@ -785,10 +881,15 @@ export async function replaceElements(
   }));
 
   if (isSupabaseConfigured()) {
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) return { ok: false, error: "Supabase no disponible." };
 
-    await supabase.from("board_elements").delete().eq("board_id", boardId);
+    const { error: delErr } = await supabase
+      .from("board_elements")
+      .delete()
+      .eq("board_id", boardId);
+    if (delErr) return { ok: false, error: formatSupabaseError(delErr) };
+
     if (normalized.length > 0) {
       const { error } = await supabase.from("board_elements").insert(
         normalized.map((el) => ({
@@ -800,7 +901,7 @@ export async function replaceElements(
           updated_at: nowIso,
         }))
       );
-      if (error) return { ok: false, error: error.message };
+      if (error) return { ok: false, error: formatSupabaseError(error) };
     }
     await supabase
       .from("boards")
@@ -830,14 +931,14 @@ export async function deleteElements(
   const nowIso = new Date().toISOString();
 
   if (isSupabaseConfigured()) {
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) return { ok: false, error: "Supabase no disponible." };
     const { error } = await supabase
       .from("board_elements")
       .delete()
       .eq("board_id", boardId)
       .in("id", elementIds);
-    if (error) return { ok: false, error: error.message };
+    if (error) return { ok: false, error: formatSupabaseError(error) };
     await supabase
       .from("boards")
       .update({ updated_at: nowIso })
@@ -862,7 +963,7 @@ export async function deleteElements(
 
 export async function listMediaForUser(user: User): Promise<MediaAsset[]> {
   if (isSupabaseConfigured()) {
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) return [];
     const { data } = await supabase
       .from("media_assets")
@@ -918,7 +1019,7 @@ export async function saveMediaAsset(
   const now = new Date().toISOString();
 
   if (isSupabaseConfigured()) {
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) throw new Error("Supabase no configurado");
     const storagePath = `${user.id}/${storedFileName}`;
 
@@ -965,7 +1066,7 @@ export async function saveMediaAsset(
       tags: asset.tags,
       created_at: asset.createdAt,
     });
-    if (dbError) throw new Error(dbError.message);
+    if (dbError) throw new Error(formatSupabaseError(dbError));
     return asset;
   }
 
@@ -1015,7 +1116,7 @@ export async function registerCloudMediaAsset(
   if (!isSupabaseConfigured()) {
     throw new Error("Registro directo solo disponible en modo nube.");
   }
-  const supabase = await getSupabaseServerClient();
+  const supabase = await getCloudDbClient();
   if (!supabase) throw new Error("Supabase no configurado");
 
   // Ensure the storage path belongs to the authenticated user
@@ -1055,7 +1156,7 @@ export async function registerCloudMediaAsset(
     tags: asset.tags,
     created_at: asset.createdAt,
   });
-  if (error) throw new Error(error.message);
+  if (error) throw new Error(formatSupabaseError(error));
 
   return asset;
 }
@@ -1066,7 +1167,7 @@ export async function updateMediaAsset(
   patch: { name?: string; tags?: string[] }
 ): Promise<{ ok: boolean; asset?: MediaAsset; error?: string }> {
   if (isSupabaseConfigured()) {
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) return { ok: false, error: "Supabase no disponible." };
     const updateData: Record<string, unknown> = {};
     if (patch.name !== undefined) updateData.name = patch.name.trim();
@@ -1078,8 +1179,13 @@ export async function updateMediaAsset(
       .eq("id", assetId)
       .eq("owner_id", user.id)
       .select("*")
-      .single();
-    if (error || !data) return { ok: false, error: error?.message ?? "No encontrado" };
+      .maybeSingle();
+    if (error || !data) {
+      return {
+        ok: false,
+        error: error ? formatSupabaseError(error) : "No encontrado",
+      };
+    }
 
     return {
       ok: true,
@@ -1121,14 +1227,14 @@ export async function deleteMediaAsset(
   assetId: string
 ): Promise<{ ok: boolean; error?: string }> {
   if (isSupabaseConfigured()) {
-    const supabase = await getSupabaseServerClient();
+    const supabase = await getCloudDbClient();
     if (!supabase) return { ok: false, error: "Supabase no disponible." };
     const { data: asset } = await supabase
       .from("media_assets")
       .select("file_name")
       .eq("id", assetId)
       .eq("owner_id", user.id)
-      .single();
+      .maybeSingle();
     if (!asset) return { ok: false, error: "Archivo no encontrado." };
 
     await supabase.storage.from("obs-media").remove([asset.file_name]);
@@ -1137,7 +1243,7 @@ export async function deleteMediaAsset(
       .delete()
       .eq("id", assetId)
       .eq("owner_id", user.id);
-    if (error) return { ok: false, error: error.message };
+    if (error) return { ok: false, error: formatSupabaseError(error) };
     return { ok: true };
   }
 

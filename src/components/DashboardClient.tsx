@@ -95,9 +95,12 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [shareTarget, setShareTarget] = useState<BoardSummary | null>(null);
   const [mediaModalOpen, setMediaModalOpen] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [createError, setCreateError] = useState<string | null>(null);
 
   const handleCreateBoard = async (e?: React.FormEvent) => {
     e?.preventDefault();
+    setCreateError(null);
     setCreating(true);
     try {
       const res = await fetch("/api/boards", {
@@ -107,25 +110,46 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
           title: newBoardTitle.trim() || `Tablero OBS ${boards.length + 1}`,
         }),
       });
-      const data = (await res.json()) as { board?: BoardSummary };
+      const data = (await res.json().catch(() => ({}))) as {
+        board?: BoardSummary;
+        error?: string;
+      };
       if (res.ok && data.board) {
         setNewBoardTitle("");
         setNewBoardOpen(false);
-        router.push(`/board/${data.board.id}`);
+        window.location.href = `/board/${data.board.id}`;
+      } else {
+        setCreateError(
+          data.error || `No se pudo crear el tablero (HTTP ${res.status}).`
+        );
       }
+    } catch {
+      setCreateError("Error de conexión al crear el tablero.");
     } finally {
       setCreating(false);
     }
   };
 
   const handleDuplicate = async (board: BoardSummary) => {
-    const res = await fetch(
-      `/api/boards/${encodeURIComponent(board.id)}/duplicate`,
-      { method: "POST" }
-    );
-    const data = (await res.json()) as { board?: BoardSummary };
-    if (res.ok && data.board) {
-      setBoards((prev) => [data.board!, ...prev]);
+    setActionError(null);
+    try {
+      const res = await fetch(
+        `/api/boards/${encodeURIComponent(board.id)}/duplicate`,
+        { method: "POST" }
+      );
+      const data = (await res.json().catch(() => ({}))) as {
+        board?: BoardSummary;
+        error?: string;
+      };
+      if (res.ok && data.board) {
+        setBoards((prev) => [data.board!, ...prev]);
+      } else {
+        setActionError(
+          data.error || `No se pudo duplicar el tablero (HTTP ${res.status}).`
+        );
+      }
+    } catch {
+      setActionError("Error de conexión al duplicar el tablero.");
     }
   };
 
@@ -137,11 +161,23 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
     ) {
       return;
     }
-    const res = await fetch(`/api/boards/${encodeURIComponent(board.id)}`, {
-      method: "DELETE",
-    });
-    if (res.ok) {
-      setBoards((prev) => prev.filter((b) => b.id !== board.id));
+    setActionError(null);
+    try {
+      const res = await fetch(`/api/boards/${encodeURIComponent(board.id)}`, {
+        method: "DELETE",
+      });
+      if (res.ok) {
+        setBoards((prev) => prev.filter((b) => b.id !== board.id));
+      } else {
+        const data = (await res.json().catch(() => ({}))) as {
+          error?: string;
+        };
+        setActionError(
+          data.error || `No se pudo eliminar el tablero (HTTP ${res.status}).`
+        );
+      }
+    } catch {
+      setActionError("Error de conexión al eliminar el tablero.");
     }
   };
 
@@ -158,8 +194,7 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
 
   const handleLogout = async () => {
     await fetch("/api/auth/logout", { method: "POST" });
-    router.push("/login");
-    router.refresh();
+    window.location.href = "/login";
   };
 
   const visibleBoards = boards.filter((b) => {
@@ -214,7 +249,10 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
 
             <button
               type="button"
-              onClick={() => setNewBoardOpen(true)}
+              onClick={() => {
+                setCreateError(null);
+                setNewBoardOpen(true);
+              }}
               className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition shadow-lg shadow-indigo-600/25"
             >
               <Plus className="w-4 h-4" />
@@ -254,6 +292,19 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
 
       {/* Main content */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-8 space-y-6">
+        {actionError && (
+          <div className="flex items-center justify-between gap-3 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
+            <span>{actionError}</span>
+            <button
+              type="button"
+              onClick={() => setActionError(null)}
+              className="text-rose-300 hover:text-white font-medium shrink-0"
+            >
+              Cerrar
+            </button>
+          </div>
+        )}
+
         {/* Toolbar row */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div>
@@ -322,7 +373,10 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
             </div>
             <button
               type="button"
-              onClick={() => setNewBoardOpen(true)}
+              onClick={() => {
+                setCreateError(null);
+                setNewBoardOpen(true);
+              }}
               className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition"
             >
               <Plus className="w-4 h-4" />
@@ -433,7 +487,10 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
       {newBoardOpen && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
-          onClick={() => setNewBoardOpen(false)}
+          onClick={() => {
+            setCreateError(null);
+            setNewBoardOpen(false);
+          }}
         >
           <form
             onSubmit={handleCreateBoard}
@@ -449,6 +506,11 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
                 conectar a OBS Studio.
               </p>
             </div>
+            {createError && (
+              <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-300 leading-relaxed">
+                {createError}
+              </div>
+            )}
             <input
               autoFocus
               type="text"
@@ -460,7 +522,10 @@ export const DashboardClient: React.FC<DashboardClientProps> = ({
             <div className="flex justify-end gap-2">
               <button
                 type="button"
-                onClick={() => setNewBoardOpen(false)}
+                onClick={() => {
+                  setCreateError(null);
+                  setNewBoardOpen(false);
+                }}
                 className="px-4 py-2 rounded-xl bg-studio-850 hover:bg-studio-800 text-xs text-zinc-300 transition"
               >
                 Cancelar

@@ -72,6 +72,7 @@ returns boolean
 language sql
 security definer
 stable
+set search_path = public
 as $$
   select exists (
     select 1 from public.boards b
@@ -90,6 +91,7 @@ returns boolean
 language sql
 security definer
 stable
+set search_path = public
 as $$
   select exists (
     select 1 from public.boards b
@@ -101,6 +103,20 @@ as $$
     where m.board_id = target_board_id
       and m.role = 'editor'
       and lower(m.email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+  );
+$$;
+
+create or replace function public.is_board_owner(target_board_id text)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.boards b
+    where b.id = target_board_id
+      and b.owner_id = auth.uid()
   );
 $$;
 
@@ -137,12 +153,15 @@ create policy "members_select_accessible" on public.board_members
 
 drop policy if exists "members_manage_owner" on public.board_members;
 create policy "members_manage_owner" on public.board_members
-  for all using (
-    exists (
-      select 1 from public.boards b
-      where b.id = board_id and b.owner_id = auth.uid()
-    )
-  );
+  for all using (public.is_board_owner(board_id))
+  with check (public.is_board_owner(board_id));
+
+-- Permisos explícitos de tabla y funciones para PostgREST
+grant usage on schema public to anon, authenticated;
+grant select, insert, update, delete on public.boards, public.board_members, public.board_elements, public.media_assets to authenticated;
+grant execute on function public.can_access_board(text) to authenticated;
+grant execute on function public.can_edit_board(text) to authenticated;
+grant execute on function public.is_board_owner(text) to authenticated;
 
 -- Board elements policies
 drop policy if exists "elements_select_accessible" on public.board_elements;
@@ -176,6 +195,14 @@ create policy "obs_media_public_read" on storage.objects
 drop policy if exists "obs_media_auth_upload" on storage.objects;
 create policy "obs_media_auth_upload" on storage.objects
   for insert with check (
+    bucket_id = 'obs-media'
+    and auth.role() = 'authenticated'
+    and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+drop policy if exists "obs_media_owner_update" on storage.objects;
+create policy "obs_media_owner_update" on storage.objects
+  for update using (
     bucket_id = 'obs-media'
     and auth.role() = 'authenticated'
     and (storage.foldername(name))[1] = auth.uid()::text

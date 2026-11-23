@@ -29,10 +29,12 @@ export async function POST(req: Request) {
           { status: 500 }
         );
       }
+      const origin = new URL(req.url).origin;
       const { data, error } = await supabase.auth.signUp({
         email,
         password,
         options: {
+          emailRedirectTo: `${origin}/auth/callback`,
           data: { name: name || email.split("@")[0] },
         },
       });

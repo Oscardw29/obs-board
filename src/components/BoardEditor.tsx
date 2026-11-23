@@ -132,6 +132,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
   const [connectionStatus, setConnectionStatus] = useState<
     "connecting" | "connected" | "disconnected"
   >("connecting");
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const [drawDefaults, setDrawDefaults] = useState<DrawDefaults>({
     strokeColor: "#ffffff",
@@ -233,6 +234,36 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
   }, []);
 
   // API persistence helpers
+  const postElementAction = useCallback(
+    async (payload: Record<string, unknown>) => {
+      try {
+        const res = await fetch(
+          `/api/boards/${encodeURIComponent(initialBoard.id)}/elements`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          }
+        );
+        if (!res.ok) {
+          const data = (await res.json().catch(() => ({}))) as {
+            error?: string;
+          };
+          setSaveError(
+            data.error || `Error guardando cambios (HTTP ${res.status})`
+          );
+        } else {
+          setSaveError(null);
+        }
+      } catch {
+        setSaveError(
+          "No se pudieron guardar los últimos cambios (error de red)."
+        );
+      }
+    },
+    [initialBoard.id]
+  );
+
   const persistUpsert = useCallback(
     async (element: BoardElement) => {
       realtimeRef.current?.sendPersistedBroadcast({
@@ -240,17 +271,13 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         senderId: clientId,
         element,
       });
-      await fetch(`/api/boards/${encodeURIComponent(initialBoard.id)}/elements`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "upsert",
-          senderId: clientId,
-          element,
-        }),
-      }).catch(() => {});
+      await postElementAction({
+        action: "upsert",
+        senderId: clientId,
+        element,
+      });
     },
-    [clientId, initialBoard.id]
+    [clientId, postElementAction]
   );
 
   const persistPatch = useCallback(
@@ -261,18 +288,14 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         elementId,
         patch,
       });
-      await fetch(`/api/boards/${encodeURIComponent(initialBoard.id)}/elements`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "patch",
-          senderId: clientId,
-          elementId,
-          patch,
-        }),
-      }).catch(() => {});
+      await postElementAction({
+        action: "patch",
+        senderId: clientId,
+        elementId,
+        patch,
+      });
     },
-    [clientId, initialBoard.id]
+    [clientId, postElementAction]
   );
 
   const persistDelete = useCallback(
@@ -282,17 +305,13 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         senderId: clientId,
         elementIds,
       });
-      await fetch(`/api/boards/${encodeURIComponent(initialBoard.id)}/elements`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "delete",
-          senderId: clientId,
-          elementIds,
-        }),
-      }).catch(() => {});
+      await postElementAction({
+        action: "delete",
+        senderId: clientId,
+        elementIds,
+      });
     },
-    [clientId, initialBoard.id]
+    [clientId, postElementAction]
   );
 
   const persistReplace = useCallback(
@@ -302,17 +321,13 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         senderId: clientId,
         elements: nextElements,
       });
-      await fetch(`/api/boards/${encodeURIComponent(initialBoard.id)}/elements`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "replace",
-          senderId: clientId,
-          elements: nextElements,
-        }),
-      }).catch(() => {});
+      await postElementAction({
+        action: "replace",
+        senderId: clientId,
+        elements: nextElements,
+      });
     },
-    [clientId, initialBoard.id]
+    [clientId, postElementAction]
   );
 
   // Realtime subscription
@@ -578,25 +593,21 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       };
       realtimeRef.current?.sendPersistedBroadcast(evt);
 
-      void fetch(`/api/boards/${encodeURIComponent(initialBoard.id)}/elements`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "triggerVideo",
-          senderId: clientId,
-          elementId,
-          triggerId: nextTriggerId,
-          triggeredAt: now,
-          playing: nextPlaying,
-          visible: nextVisible,
-          loop: el.loop,
-          muted: el.muted,
-          volume: el.volume,
-          autoHideOnEnd: el.autoHideOnEnd,
-        }),
-      }).catch(() => {});
+      void postElementAction({
+        action: "triggerVideo",
+        senderId: clientId,
+        elementId,
+        triggerId: nextTriggerId,
+        triggeredAt: now,
+        playing: nextPlaying,
+        visible: nextVisible,
+        loop: el.loop,
+        muted: el.muted,
+        volume: el.volume,
+        autoHideOnEnd: el.autoHideOnEnd,
+      });
     },
-    [canEdit, clientId, initialBoard.id]
+    [canEdit, clientId, postElementAction]
   );
 
   const handleInsertAsset = useCallback(
@@ -811,11 +822,27 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     setEditingTitle(false);
     const clean = title.trim() || "Tablero OBS";
     setTitle(clean);
-    await fetch(`/api/boards/${encodeURIComponent(initialBoard.id)}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: clean, senderId: clientId }),
-    }).catch(() => {});
+    realtimeRef.current?.sendPersistedBroadcast({
+      type: "board:meta",
+      senderId: clientId,
+      title: clean,
+    });
+    try {
+      const res = await fetch(
+        `/api/boards/${encodeURIComponent(initialBoard.id)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: clean, senderId: clientId }),
+        }
+      );
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        setSaveError(data.error || "No se pudo guardar el título del tablero.");
+      }
+    } catch {
+      setSaveError("No se pudo guardar el título del tablero (error de red).");
+    }
   };
 
   // Copy OBS URL
@@ -1405,7 +1432,9 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     if (files && files.length > 0) {
       for (const file of Array.from(files)) {
         const res = await uploadMediaFile(file);
-        if (res.asset) {
+        if (res.error) {
+          setSaveError(res.error);
+        } else if (res.asset) {
           setAssets((prev) => [res.asset!, ...prev]);
           handleInsertAsset(
             res.asset,
@@ -1643,6 +1672,22 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
               onBackdropChange={setBackdrop}
             />
           </div>
+
+          {saveError && (
+            <div
+              className="absolute bottom-4 right-4 z-40 max-w-md flex items-center justify-between gap-3 rounded-xl border border-rose-500/50 bg-studio-900/95 px-3.5 py-2.5 text-xs text-rose-200 shadow-2xl backdrop-blur"
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              <span>{saveError}</span>
+              <button
+                type="button"
+                onClick={() => setSaveError(null)}
+                className="text-rose-300 hover:text-white font-medium shrink-0"
+              >
+                Cerrar
+              </button>
+            </div>
+          )}
 
           {/* Transformed Infinite Stage Layer */}
           <div
