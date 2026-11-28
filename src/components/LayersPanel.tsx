@@ -451,7 +451,6 @@ export const LayersPanel: React.FC<LayersPanelProps> = ({
                         onClick={() =>
                           onControlAudio(el.id, {
                             playing: !el.playing,
-                            currentTimeSec: el.currentTimeSec ?? 0,
                             commit: true,
                           })
                         }

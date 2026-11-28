@@ -15,11 +15,47 @@ import type { BoardElement } from "@/types/board";
 
 export interface AudioControlUpdate {
   playing: boolean;
-  currentTimeSec: number;
+  /** Only provide when explicitly seeking/restarting; omit for volume/mute/loop/pause-in-place */
+  currentTimeSec?: number;
   commit?: boolean;
   loop?: boolean;
   muted?: boolean;
   volume?: number;
+}
+
+// Lightweight live playback time pub/sub so the right-hand inspector tracks live seconds
+// without re-rendering BoardEditor or triggering audio seeks.
+const liveAudioTimeMap = new Map<string, number>();
+const liveAudioTimeListeners = new Map<string, Set<(sec: number) => void>>();
+
+function emitLiveAudioTime(elementId: string, sec: number) {
+  liveAudioTimeMap.set(elementId, sec);
+  const subs = liveAudioTimeListeners.get(elementId);
+  if (subs) {
+    for (const cb of subs) cb(sec);
+  }
+}
+
+export function getLiveAudioTime(elementId: string): number | undefined {
+  return liveAudioTimeMap.get(elementId);
+}
+
+export function subscribeLiveAudioTime(
+  elementId: string,
+  cb: (sec: number) => void
+): () => void {
+  let subs = liveAudioTimeListeners.get(elementId);
+  if (!subs) {
+    subs = new Set();
+    liveAudioTimeListeners.set(elementId, subs);
+  }
+  subs.add(cb);
+  return () => {
+    subs?.delete(cb);
+    if (subs && subs.size === 0) {
+      liveAudioTimeListeners.delete(elementId);
+    }
+  };
 }
 
 interface AudioElementNodeProps {
@@ -240,6 +276,7 @@ export const AudioElementNode: React.FC<AudioElementNodeProps> = ({
         }
       }
       setCurrentTime(targetSec);
+      emitLiveAudioTime(element.id, targetSec);
     };
 
     const playSafe = () => {
@@ -277,6 +314,7 @@ export const AudioElementNode: React.FC<AudioElementNodeProps> = ({
       audio.pause();
     }
   }, [
+    element.id,
     element.seekId,
     element.currentTimeSec,
     element.triggeredAt,
@@ -291,7 +329,9 @@ export const AudioElementNode: React.FC<AudioElementNodeProps> = ({
     const tick = () => {
       const audio = audioRef.current;
       if (audio && !isScrubbingRef.current) {
-        setCurrentTime(audio.currentTime || 0);
+        const t = audio.currentTime || 0;
+        setCurrentTime(t);
+        emitLiveAudioTime(element.id, t);
         if (Number.isFinite(audio.duration) && audio.duration > 0) {
           setDuration(audio.duration);
         }
@@ -312,7 +352,7 @@ export const AudioElementNode: React.FC<AudioElementNodeProps> = ({
         rafRef.current = null;
       }
     };
-  }, [isPlaying, mode]);
+  }, [element.id, isPlaying, mode]);
 
   // Scrubbing helper (works on BOTH waveform visualizer and dedicated slider!)
   const seekToRatio = useCallback(
@@ -328,6 +368,7 @@ export const AudioElementNode: React.FC<AudioElementNodeProps> = ({
       const nextTime = totalDur > 0 ? Number((clamped * totalDur).toFixed(2)) : 0;
 
       setCurrentTime(nextTime);
+      emitLiveAudioTime(element.id, nextTime);
       if (audio && totalDur > 0) {
         try {
           audio.currentTime = nextTime;
@@ -442,6 +483,7 @@ export const AudioElementNode: React.FC<AudioElementNodeProps> = ({
       }
     }
     setCurrentTime(0);
+    emitLiveAudioTime(element.id, 0);
     onAudioControl?.(element.id, {
       playing: true,
       currentTimeSec: 0,
@@ -454,7 +496,6 @@ export const AudioElementNode: React.FC<AudioElementNodeProps> = ({
     if (!canEdit) return;
     onAudioControl?.(element.id, {
       playing: isPlaying,
-      currentTimeSec: Number(currentTime.toFixed(2)),
       muted: !element.muted,
       commit: true,
     });
@@ -465,7 +506,6 @@ export const AudioElementNode: React.FC<AudioElementNodeProps> = ({
     if (!canEdit) return;
     onAudioControl?.(element.id, {
       playing: isPlaying,
-      currentTimeSec: Number(currentTime.toFixed(2)),
       loop: !isLoop,
       commit: true,
     });
@@ -544,6 +584,7 @@ export const AudioElementNode: React.FC<AudioElementNodeProps> = ({
         onEnded={() => {
           if (!isLoop) {
             setCurrentTime(0);
+            emitLiveAudioTime(element.id, 0);
             if (audioRef.current) {
               try {
                 audioRef.current.currentTime = 0;

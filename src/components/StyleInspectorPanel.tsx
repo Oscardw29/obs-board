@@ -68,6 +68,8 @@ import {
 } from "@/types/board";
 import {
   formatAudioTime,
+  getLiveAudioTime,
+  subscribeLiveAudioTime,
   type AudioControlUpdate,
 } from "./AudioElementNode";
 import { CustomColorPicker } from "./ui/CustomColorPicker";
@@ -159,6 +161,19 @@ export const StyleInspectorPanel: React.FC<StyleInspectorPanelProps> = ({
 
   const selected = selectedElements.length === 1 ? selectedElements[0] : null;
   const isMulti = selectedElements.length > 1;
+
+  // Live audio playback time for the selected audio element (avoids stale seek jumps)
+  const [liveAudioSec, setLiveAudioSec] = useState<number>(0);
+  useEffect(() => {
+    if (!selected || selected.type !== "audio") {
+      setLiveAudioSec(0);
+      return;
+    }
+    setLiveAudioSec(getLiveAudioTime(selected.id) ?? selected.currentTimeSec ?? 0);
+    return subscribeLiveAudioTime(selected.id, (sec) => {
+      setLiveAudioSec(sec);
+    });
+  }, [selected?.id, selected?.type, selected?.currentTimeSec]);
 
   useEffect(() => {
     try {
@@ -933,7 +948,7 @@ export const StyleInspectorPanel: React.FC<StyleInspectorPanelProps> = ({
                       <span>Control de Audio</span>
                     </p>
                     <span className="text-[10px] font-mono tabular-nums text-orange-300">
-                      {formatAudioTime(selected.currentTimeSec ?? 0)} /{" "}
+                      {formatAudioTime(liveAudioSec)} /{" "}
                       {formatAudioTime(selected.durationSec ?? 0)}
                     </span>
                   </div>
@@ -949,7 +964,6 @@ export const StyleInspectorPanel: React.FC<StyleInspectorPanelProps> = ({
                       onClick={() =>
                         onControlAudio(selected.id, {
                           playing: !selected.playing,
-                          currentTimeSec: selected.currentTimeSec ?? 0,
                           commit: true,
                         })
                       }
@@ -991,21 +1005,23 @@ export const StyleInspectorPanel: React.FC<StyleInspectorPanelProps> = ({
                       max={Math.max(1, Math.round(selected.durationSec ?? 1))}
                       step={1}
                       unit="s"
-                      value={Math.round(selected.currentTimeSec ?? 0)}
-                      onChange={(val) =>
+                      value={Math.round(liveAudioSec)}
+                      onChange={(val) => {
+                        setLiveAudioSec(val);
                         onControlAudio(selected.id, {
                           playing: Boolean(selected.playing),
                           currentTimeSec: val,
                           commit: false,
-                        })
-                      }
-                      onCommit={(val) =>
+                        });
+                      }}
+                      onCommit={(val) => {
+                        setLiveAudioSec(val);
                         onControlAudio(selected.id, {
                           playing: Boolean(selected.playing),
                           currentTimeSec: val,
                           commit: true,
-                        })
-                      }
+                        });
+                      }}
                     />
                   )}
 
@@ -1015,7 +1031,6 @@ export const StyleInspectorPanel: React.FC<StyleInspectorPanelProps> = ({
                     onChange={(checked) =>
                       onControlAudio(selected.id, {
                         playing: Boolean(selected.playing),
-                        currentTimeSec: selected.currentTimeSec ?? 0,
                         loop: checked,
                         commit: true,
                       })
@@ -1028,7 +1043,6 @@ export const StyleInspectorPanel: React.FC<StyleInspectorPanelProps> = ({
                       onClick={() =>
                         onControlAudio(selected.id, {
                           playing: Boolean(selected.playing),
-                          currentTimeSec: selected.currentTimeSec ?? 0,
                           muted: !selected.muted,
                           commit: true,
                         })
@@ -1050,7 +1064,14 @@ export const StyleInspectorPanel: React.FC<StyleInspectorPanelProps> = ({
                       onChange={(val) =>
                         onControlAudio(selected.id, {
                           playing: Boolean(selected.playing),
-                          currentTimeSec: selected.currentTimeSec ?? 0,
+                          volume: val / 100,
+                          muted: val === 0,
+                          commit: false,
+                        })
+                      }
+                      onCommit={(val) =>
+                        onControlAudio(selected.id, {
+                          playing: Boolean(selected.playing),
                           volume: val / 100,
                           muted: val === 0,
                           commit: true,

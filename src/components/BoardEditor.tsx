@@ -1312,7 +1312,14 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       if (!el || el.type !== "audio") return;
 
       const now = Date.now();
-      const nextSeekId = `ask_${nanoid(8)}`;
+      const isExplicitSeek = update.currentTimeSec !== undefined;
+      const nextSeekId = isExplicitSeek
+        ? `ask_${nanoid(8)}`
+        : (el.seekId ?? "");
+      const nextTimeSec = isExplicitSeek
+        ? update.currentTimeSec!
+        : (el.currentTimeSec ?? 0);
+      const nextTriggeredAt = isExplicitSeek ? now : (el.triggeredAt ?? now);
       const nextLoop = update.loop !== undefined ? update.loop : el.loop;
       const nextMuted = update.muted !== undefined ? update.muted : el.muted;
       const nextVolume = update.volume !== undefined ? update.volume : el.volume;
@@ -1323,8 +1330,8 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
             ? {
                 ...item,
                 playing: update.playing,
-                currentTimeSec: update.currentTimeSec,
-                triggeredAt: now,
+                currentTimeSec: nextTimeSec,
+                triggeredAt: nextTriggeredAt,
                 seekId: nextSeekId,
                 loop: nextLoop,
                 muted: nextMuted,
@@ -1340,8 +1347,8 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         senderId: clientId,
         elementId,
         playing: update.playing,
-        currentTimeSec: update.currentTimeSec,
-        triggeredAt: now,
+        currentTimeSec: nextTimeSec,
+        triggeredAt: nextTriggeredAt,
         seekId: nextSeekId,
         loop: nextLoop,
         muted: nextMuted,
@@ -1349,7 +1356,10 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       };
 
       if (update.commit === false) {
-        realtimeRef.current?.sendEphemeral(evt);
+        if (now - lastLiveBroadcastRef.current > 50) {
+          lastLiveBroadcastRef.current = now;
+          realtimeRef.current?.sendEphemeral(evt);
+        }
         return;
       }
 
@@ -1362,8 +1372,8 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
           senderId: clientId,
           elementId,
           playing: update.playing,
-          currentTimeSec: update.currentTimeSec,
-          triggeredAt: now,
+          currentTimeSec: nextTimeSec,
+          triggeredAt: nextTriggeredAt,
           seekId: nextSeekId,
           loop: nextLoop,
           muted: nextMuted,
