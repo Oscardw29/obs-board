@@ -14,9 +14,22 @@ create table if not exists public.boards (
   obs_token text not null unique,
   stage_width integer not null default 1920,
   stage_height integer not null default 1080,
+  background_image_url text,
+  background_image_fit text not null default 'cover',
+  background_opacity double precision not null default 1,
+  background_show_in_obs boolean not null default false,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.boards
+  add column if not exists background_image_url text;
+alter table public.boards
+  add column if not exists background_image_fit text not null default 'cover';
+alter table public.boards
+  add column if not exists background_opacity double precision not null default 1;
+alter table public.boards
+  add column if not exists background_show_in_obs boolean not null default false;
 
 -- 2. Miembros invitados (control de acceso privado por correo)
 create table if not exists public.board_members (
@@ -61,7 +74,7 @@ create table if not exists public.media_assets (
   board_id text references public.boards(id) on delete set null,
   folder_id text references public.media_folders(id) on delete set null,
   name text not null,
-  kind text not null check (kind in ('video', 'image', 'document', 'font')),
+  kind text not null check (kind in ('video', 'image', 'audio', 'document', 'font')),
   mime_type text not null,
   url text not null,
   file_name text not null,
@@ -92,7 +105,7 @@ alter table public.media_assets
   drop constraint if exists media_assets_kind_check;
 alter table public.media_assets
   add constraint media_assets_kind_check
-  check (kind in ('video', 'image', 'document', 'font'));
+  check (kind in ('video', 'image', 'audio', 'document', 'font'));
 
 -- Índices
 create index if not exists idx_boards_owner on public.boards(owner_id);

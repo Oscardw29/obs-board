@@ -2,6 +2,7 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import {
+  AudioLines,
   FileText,
   Film,
   Folder,
@@ -16,6 +17,7 @@ import {
 } from "lucide-react";
 import { uploadMediaFile } from "@/lib/client-media-upload";
 import type { MediaAsset, MediaFolder } from "@/types/board";
+import { buildOscilloscopePath } from "./AudioElementNode";
 import { ConfirmModal } from "./ui/ConfirmModal";
 import { CustomColorPicker } from "./ui/CustomColorPicker";
 
@@ -49,7 +51,10 @@ export const MediaManagerModal: React.FC<MediaManagerModalProps> = ({
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState<"all" | "video" | "image" | "document">("all");
+  const [filter, setFilter] = useState<
+    "all" | "video" | "audio" | "image" | "document"
+  >("all");
+  const [fileDragOver, setFileDragOver] = useState(false);
   const [query, setQuery] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
@@ -89,16 +94,21 @@ export const MediaManagerModal: React.FC<MediaManagerModalProps> = ({
 
   if (!open) return null;
 
-  const handleUploadFiles = async (files: FileList | null) => {
+  const handleUploadFiles = async (
+    files: FileList | null,
+    overrideFolderId?: string | null
+  ) => {
     if (!files || files.length === 0) return;
     setError(null);
     setUploading(true);
     try {
       const uploaded: MediaAsset[] = [];
       const targetFolder =
-        activeFolderId !== "all" && activeFolderId !== "root"
-          ? activeFolderId
-          : null;
+        overrideFolderId !== undefined
+          ? overrideFolderId
+          : activeFolderId !== "all" && activeFolderId !== "root"
+            ? activeFolderId
+            : null;
       for (const file of Array.from(files)) {
         const res = await uploadMediaFile(file, { folderId: targetFolder });
         if (res.error || !res.asset) {
@@ -219,17 +229,46 @@ export const MediaManagerModal: React.FC<MediaManagerModalProps> = ({
         <div
           role="dialog"
           aria-modal="true"
-          className="w-full max-w-5xl rounded-2xl bg-studio-900 border border-white/[0.1] shadow-2xl overflow-hidden flex flex-col max-h-[86vh] animate-modal-enter"
+          className={`w-full max-w-5xl rounded-2xl bg-studio-900 border shadow-2xl overflow-hidden flex flex-col max-h-[86vh] animate-modal-enter transition-colors ${
+            fileDragOver
+              ? "border-sky-400 ring-2 ring-sky-400/40"
+              : "border-white/[0.1]"
+          }`}
           onClick={(e) => e.stopPropagation()}
+          onDragOver={(e) => {
+            if (
+              e.dataTransfer.types.includes("Files") &&
+              !e.dataTransfer.types.includes("application/x-oboards-move-asset")
+            ) {
+              e.preventDefault();
+              setFileDragOver(true);
+            }
+          }}
+          onDragLeave={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+              setFileDragOver(false);
+            }
+          }}
+          onDrop={(e) => {
+            setFileDragOver(false);
+            if (
+              e.dataTransfer.files &&
+              e.dataTransfer.files.length > 0 &&
+              !e.dataTransfer.getData("application/x-oboards-move-asset")
+            ) {
+              e.preventDefault();
+              void handleUploadFiles(e.dataTransfer.files);
+            }
+          }}
         >
           <div className="flex items-center justify-between px-6 py-4 border-b border-white/[0.08]">
             <div>
               <h2 className="text-base font-semibold text-white">
-                Biblioteca de Clips, Imágenes y Carpetas
+                Biblioteca de Clips, Audios, Imágenes y Carpetas
               </h2>
               <p className="text-xs text-zinc-400">
-                Organiza tus recursos en carpetas de colores y arrastra archivos
-                entre carpetas.
+                Arrastra archivos desde tu computadora directamente aquí para
+                importarlos, o organízalos en carpetas.
               </p>
             </div>
             <div className="flex items-center gap-2">
@@ -237,7 +276,7 @@ export const MediaManagerModal: React.FC<MediaManagerModalProps> = ({
                 ref={fileInputRef}
                 type="file"
                 multiple
-                accept="video/mp4,video/webm,video/quicktime,image/png,image/jpeg,image/webp,image/gif,.ttf,.otf,.woff,.woff2"
+                accept="video/mp4,video/webm,video/quicktime,audio/mpeg,audio/wav,audio/ogg,audio/mp4,audio/aac,audio/flac,audio/webm,.mp3,.wav,.ogg,.m4a,.aac,.flac,.opus,image/png,image/jpeg,image/webp,image/gif,.ttf,.otf,.woff,.woff2"
                 className="hidden"
                 onChange={(e) => handleUploadFiles(e.target.files)}
               />
@@ -278,6 +317,7 @@ export const MediaManagerModal: React.FC<MediaManagerModalProps> = ({
                 [
                   ["all", "Todos"],
                   ["video", "Videos"],
+                  ["audio", "Audios"],
                   ["image", "Imágenes"],
                   ["document", "Docs"],
                 ] as const
@@ -353,8 +393,15 @@ export const MediaManagerModal: React.FC<MediaManagerModalProps> = ({
                     type="button"
                     onDragOver={(e) => e.preventDefault()}
                     onDrop={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setFileDragOver(false);
                       const aid = e.dataTransfer.getData("application/x-oboards-move-asset");
-                      if (aid) void handleMoveAssetToFolder(aid, folder.id);
+                      if (aid) {
+                        void handleMoveAssetToFolder(aid, folder.id);
+                      } else if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                        void handleUploadFiles(e.dataTransfer.files, folder.id);
+                      }
                     }}
                     onClick={() => setActiveFolderId(folder.id)}
                     className={`w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg text-xs transition-colors ${
@@ -458,6 +505,34 @@ export const MediaManagerModal: React.FC<MediaManagerModalProps> = ({
                             }}
                             className="w-full h-full object-contain"
                           />
+                        ) : asset.kind === "audio" ? (
+                          <div className="w-full h-full bg-black flex items-center justify-center p-3">
+                            {asset.metadata?.waveformPeaks?.length ? (
+                              <svg
+                                viewBox="0 0 300 70"
+                                preserveAspectRatio="none"
+                                className="w-full h-full"
+                              >
+                                <path
+                                  d={buildOscilloscopePath(
+                                    asset.metadata.waveformPeaks,
+                                    300,
+                                    70
+                                  )}
+                                  fill="none"
+                                  stroke="#fb923c"
+                                  strokeWidth={2.5}
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                />
+                              </svg>
+                            ) : (
+                              <div className="flex flex-col items-center gap-1 text-orange-400">
+                                <AudioLines className="w-7 h-7" />
+                                <span className="text-[11px] font-mono">Audio</span>
+                              </div>
+                            )}
+                          </div>
                         ) : asset.kind === "font" ? (
                           <div className="flex flex-col items-center gap-1 text-sky-300">
                             <TypeIcon className="w-7 h-7" />
@@ -473,6 +548,8 @@ export const MediaManagerModal: React.FC<MediaManagerModalProps> = ({
                         <span className="absolute top-1.5 left-1.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-black/75 text-[10px] font-medium text-zinc-200">
                           {asset.kind === "video" ? (
                             <Film className="w-2.5 h-2.5 text-sky-400" />
+                          ) : asset.kind === "audio" ? (
+                            <AudioLines className="w-2.5 h-2.5 text-orange-400" />
                           ) : asset.kind === "document" ? (
                             <FileText className="w-2.5 h-2.5 text-amber-400" />
                           ) : asset.kind === "font" ? (
@@ -482,11 +559,13 @@ export const MediaManagerModal: React.FC<MediaManagerModalProps> = ({
                           )}
                           {asset.kind === "video"
                             ? formatDuration(asset.durationSec) || "Video"
-                            : asset.kind === "document"
-                              ? `${asset.metadata?.documentPages?.length ?? 1} pág.`
-                              : asset.kind === "font"
-                                ? "Fuente"
-                                : "Img"}
+                            : asset.kind === "audio"
+                              ? formatDuration(asset.durationSec) || "Audio"
+                              : asset.kind === "document"
+                                ? `${asset.metadata?.documentPages?.length ?? 1} pág.`
+                                : asset.kind === "font"
+                                  ? "Fuente"
+                                  : "Img"}
                         </span>
                       </div>
 

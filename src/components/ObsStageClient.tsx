@@ -6,6 +6,7 @@ import { connectBoardRealtime } from "@/lib/client-realtime";
 import {
   STAGE_HEIGHT,
   STAGE_WIDTH,
+  type BoardBackgroundConfig,
   type BoardElement,
   type RealtimeEvent,
 } from "@/types/board";
@@ -17,6 +18,7 @@ interface ObsStageClientProps {
   stageWidth?: number;
   stageHeight?: number;
   initialElements: BoardElement[];
+  initialBackground?: BoardBackgroundConfig;
 }
 
 export const ObsStageClient: React.FC<ObsStageClientProps> = ({
@@ -25,9 +27,13 @@ export const ObsStageClient: React.FC<ObsStageClientProps> = ({
   stageWidth = STAGE_WIDTH,
   stageHeight = STAGE_HEIGHT,
   initialElements,
+  initialBackground,
 }) => {
   const clientId = useMemo(() => `obs_${nanoid(10)}`, []);
   const [elements, setElements] = useState<BoardElement[]>(initialElements);
+  const [background, setBackground] = useState<BoardBackgroundConfig | undefined>(
+    initialBackground
+  );
   const [liveDrafts, setLiveDrafts] = useState<
     Record<string, { element: BoardElement; receivedAt: number }>
   >({});
@@ -73,12 +79,16 @@ export const ObsStageClient: React.FC<ObsStageClientProps> = ({
         const data = (await res.json()) as {
           unchanged?: boolean;
           hash?: string;
-          board?: { elements: BoardElement[] };
+          board?: {
+            elements: BoardElement[];
+            background?: BoardBackgroundConfig;
+          };
         };
         if (data.hash) lastHashRef.current = data.hash;
         if (data.unchanged) return;
         if (data.board?.elements) {
           setElements(data.board.elements);
+          setBackground(data.board.background);
           setLiveDrafts({});
         }
       } catch {
@@ -251,6 +261,30 @@ export const ObsStageClient: React.FC<ObsStageClientProps> = ({
               )
             );
             break;
+          case "audio:control":
+            setElements((prev) =>
+              prev.map((e) =>
+                e.id === event.elementId
+                  ? {
+                      ...e,
+                      playing: event.playing,
+                      currentTimeSec: event.currentTimeSec,
+                      triggeredAt: event.triggeredAt,
+                      seekId: event.seekId,
+                      loop: event.loop !== undefined ? event.loop : e.loop,
+                      muted: event.muted !== undefined ? event.muted : e.muted,
+                      volume:
+                        event.volume !== undefined ? event.volume : e.volume,
+                    }
+                  : e
+              )
+            );
+            break;
+          case "board:meta":
+            if (event.background !== undefined) {
+              setBackground(event.background);
+            }
+            break;
           default:
             break;
         }
@@ -310,6 +344,22 @@ export const ObsStageClient: React.FC<ObsStageClientProps> = ({
           backgroundColor: "transparent",
         }}
       >
+        {background?.imageUrl && background.showInObs && (
+          <img
+            src={background.imageUrl}
+            alt=""
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: "100%",
+              height: "100%",
+              objectFit: background.fit ?? "cover",
+              opacity: background.opacity ?? 1,
+              zIndex: 0,
+              pointerEvents: "none",
+            }}
+          />
+        )}
         {elements.map((el) => (
           <StageElement key={el.id} element={el} mode="obs" />
         ))}

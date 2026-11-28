@@ -36,6 +36,7 @@ export default async function ObsBoardPage({
       stageWidth={board.stageWidth}
       stageHeight={board.stageHeight}
       initialElements={board.elements}
+      initialBackground={board.background}
     />
   );
 }

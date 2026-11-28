@@ -2,6 +2,7 @@
 
 import React, { useRef, useState } from "react";
 import {
+  AudioLines,
   Check,
   FileText,
   Film,
@@ -19,6 +20,7 @@ import {
 } from "lucide-react";
 import { uploadMediaFile } from "@/lib/client-media-upload";
 import type { BoardElement, MediaAsset, MediaFolder } from "@/types/board";
+import { buildOscilloscopePath } from "./AudioElementNode";
 import { ConfirmModal } from "./ui/ConfirmModal";
 import { CustomColorPicker } from "./ui/CustomColorPicker";
 
@@ -68,10 +70,13 @@ export const MediaLibraryPanel: React.FC<MediaLibraryPanelProps> = ({
   onQuickTriggerExisting,
 }) => {
   const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<"all" | "video" | "image" | "document">("all");
+  const [filter, setFilter] = useState<
+    "all" | "video" | "image" | "audio" | "document"
+  >("all");
   const [activeFolderId, setActiveFolderId] = useState<string | "all" | "root">("all");
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [fileDragOver, setFileDragOver] = useState(false);
 
   // Default behavior when inserting a clip (autoHideOnEnd ON by default!)
   const [defaultLoop, setDefaultLoop] = useState(false);
@@ -96,14 +101,19 @@ export const MediaLibraryPanel: React.FC<MediaLibraryPanelProps> = ({
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const handleUpload = async (files: FileList | null) => {
+  const handleUpload = async (
+    files: FileList | null,
+    overrideFolderId?: string | null
+  ) => {
     if (!files || files.length === 0) return;
     setError(null);
     setUploading(true);
     const targetFolder =
-      activeFolderId !== "all" && activeFolderId !== "root"
-        ? activeFolderId
-        : null;
+      overrideFolderId !== undefined
+        ? overrideFolderId
+        : activeFolderId !== "all" && activeFolderId !== "root"
+          ? activeFolderId
+          : null;
     try {
       for (const file of Array.from(files)) {
         const res = await uploadMediaFile(file, {
@@ -282,14 +292,47 @@ export const MediaLibraryPanel: React.FC<MediaLibraryPanelProps> = ({
 
   return (
     <>
-      <div className="flex-1 flex flex-col min-h-0 select-none animate-panel-enter">
+      <div
+        className={`flex-1 flex flex-col min-h-0 select-none animate-panel-enter relative transition-colors ${
+          fileDragOver ? "bg-sky-500/10 ring-2 ring-inset ring-sky-400" : ""
+        }`}
+        onDragOver={(e) => {
+          if (
+            canEdit &&
+            e.dataTransfer.types.includes("Files") &&
+            !e.dataTransfer.types.includes("application/x-oboards-move-asset")
+          ) {
+            e.preventDefault();
+            e.stopPropagation();
+            setFileDragOver(true);
+          }
+        }}
+        onDragLeave={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+            setFileDragOver(false);
+          }
+        }}
+        onDrop={(e) => {
+          setFileDragOver(false);
+          if (
+            canEdit &&
+            e.dataTransfer.files &&
+            e.dataTransfer.files.length > 0 &&
+            !e.dataTransfer.getData("application/x-oboards-move-asset")
+          ) {
+            e.preventDefault();
+            e.stopPropagation();
+            void handleUpload(e.dataTransfer.files);
+          }
+        }}
+      >
         {/* Header actions */}
         <div className="p-3 border-b border-white/[0.07] space-y-2.5">
           <input
             ref={fileInputRef}
             type="file"
             multiple
-            accept="video/mp4,video/webm,video/quicktime,image/png,image/jpeg,image/webp,image/gif,.ttf,.otf,.woff,.woff2"
+            accept="video/mp4,video/webm,video/quicktime,audio/mpeg,audio/wav,audio/ogg,audio/mp4,audio/aac,audio/flac,audio/webm,.mp3,.wav,.ogg,.m4a,.aac,.flac,.opus,image/png,image/jpeg,image/webp,image/gif,.ttf,.otf,.woff,.woff2"
             className="hidden"
             onChange={(e) => handleUpload(e.target.files)}
           />
@@ -329,11 +372,12 @@ export const MediaLibraryPanel: React.FC<MediaLibraryPanelProps> = ({
           </div>
 
           {/* Kind filter tabs */}
-          <div className="grid grid-cols-4 gap-1 bg-studio-950 p-0.5 rounded-lg border border-white/[0.07] text-[10px]">
+          <div className="grid grid-cols-5 gap-1 bg-studio-950 p-0.5 rounded-lg border border-white/[0.07] text-[10px]">
             {(
               [
                 ["all", "Todo"],
                 ["video", "Clips"],
+                ["audio", "Audio"],
                 ["image", "Img"],
                 ["document", "Docs"],
               ] as const
@@ -463,9 +507,15 @@ export const MediaLibraryPanel: React.FC<MediaLibraryPanelProps> = ({
                     onDragLeave={() => setDragOverFolderId(null)}
                     onDrop={(e) => {
                       e.preventDefault();
+                      e.stopPropagation();
                       setDragOverFolderId(null);
+                      setFileDragOver(false);
                       const aid = e.dataTransfer.getData("application/x-oboards-move-asset");
-                      if (aid) void handleMoveAssetToFolder(aid, folder.id);
+                      if (aid) {
+                        void handleMoveAssetToFolder(aid, folder.id);
+                      } else if (e.dataTransfer.files && e.dataTransfer.files.length > 0 && canEdit) {
+                        void handleUpload(e.dataTransfer.files, folder.id);
+                      }
                     }}
                     title="Clic para abrir · Suelta un archivo aquí para moverlo"
                     className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-medium border transition-[transform,colors] ${
@@ -634,14 +684,17 @@ export const MediaLibraryPanel: React.FC<MediaLibraryPanelProps> = ({
                   : "Sin archivos aquí"}
               </p>
               <p className="text-[11px] text-zinc-500 leading-relaxed">
-                Sube videos, imágenes, fuentes o documentos. Arrastra archivos
-                sobre las carpetas para organizarlos o al lienzo para insertarlos.
+                Arrastra archivos desde tu carpeta directamente aquí (videos,
+                audios MP3/WAV, imágenes, fuentes o PDF) o al lienzo para
+                insertarlos.
               </p>
             </div>
           ) : (
             filtered.map((asset) => {
               const existingOnBoard = boardElements.find(
-                (el) => el.type === "video" && el.mediaAssetId === asset.id
+                (el) =>
+                  (el.type === "video" || el.type === "audio") &&
+                  el.mediaAssetId === asset.id
               );
 
               return (
@@ -691,6 +744,36 @@ export const MediaLibraryPanel: React.FC<MediaLibraryPanelProps> = ({
                         }}
                         className="w-full h-full object-contain"
                       />
+                    ) : asset.kind === "audio" ? (
+                      <div className="w-full h-full bg-black flex items-center justify-center p-3">
+                        {asset.metadata?.waveformPeaks?.length ? (
+                          <svg
+                            viewBox="0 0 300 70"
+                            preserveAspectRatio="none"
+                            className="w-full h-full"
+                          >
+                            <path
+                              d={buildOscilloscopePath(
+                                asset.metadata.waveformPeaks,
+                                300,
+                                70
+                              )}
+                              fill="none"
+                              stroke="#fb923c"
+                              strokeWidth={2.5}
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            />
+                          </svg>
+                        ) : (
+                          <div className="flex flex-col items-center gap-1 text-orange-400">
+                            <AudioLines className="w-6 h-6" />
+                            <span className="text-[10px] font-mono">
+                              Audio (Solo sonido en OBS)
+                            </span>
+                          </div>
+                        )}
+                      </div>
                     ) : asset.kind === "font" ? (
                       <div className="flex flex-col items-center gap-1 text-sky-300">
                         <TypeIcon className="w-6 h-6" />
@@ -709,6 +792,8 @@ export const MediaLibraryPanel: React.FC<MediaLibraryPanelProps> = ({
                     <span className="absolute top-1.5 left-1.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-black/75 text-[10px] text-zinc-200">
                       {asset.kind === "video" ? (
                         <Film className="w-2.5 h-2.5 text-sky-400" />
+                      ) : asset.kind === "audio" ? (
+                        <AudioLines className="w-2.5 h-2.5 text-orange-400" />
                       ) : asset.kind === "document" ? (
                         <FileText className="w-2.5 h-2.5 text-amber-400" />
                       ) : asset.kind === "font" ? (
@@ -718,11 +803,13 @@ export const MediaLibraryPanel: React.FC<MediaLibraryPanelProps> = ({
                       )}
                       {asset.kind === "video"
                         ? formatDuration(asset.durationSec) || "Clip"
-                        : asset.kind === "document"
-                          ? `${asset.metadata?.documentPages?.length ?? 1} pág.`
-                          : asset.kind === "font"
-                            ? "Font"
-                            : "Img"}
+                        : asset.kind === "audio"
+                          ? formatDuration(asset.durationSec) || "Audio"
+                          : asset.kind === "document"
+                            ? `${asset.metadata?.documentPages?.length ?? 1} pág.`
+                            : asset.kind === "font"
+                              ? "Font"
+                              : "Img"}
                     </span>
 
                     {canEdit && (

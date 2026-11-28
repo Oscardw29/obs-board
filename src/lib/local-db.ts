@@ -5,6 +5,7 @@ import { nanoid } from "nanoid";
 import {
   STAGE_HEIGHT,
   STAGE_WIDTH,
+  type BoardBackgroundConfig,
   type BoardElement,
   type BoardMember,
   type MediaAsset,
@@ -25,6 +26,7 @@ export interface LocalBoardRecord {
   obsToken: string;
   stageWidth: number;
   stageHeight: number;
+  background?: BoardBackgroundConfig;
   createdAt: string;
   updatedAt: string;
 }

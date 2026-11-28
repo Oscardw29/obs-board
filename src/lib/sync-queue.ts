@@ -1,5 +1,15 @@
 export type QueuedBoardAction = {
-  kind: "upsert" | "upsertMany" | "patch" | "batchPatch" | "replace" | "delete" | "triggerVideo" | "authorVisibility" | "authorDelete";
+  kind:
+    | "upsert"
+    | "upsertMany"
+    | "patch"
+    | "batchPatch"
+    | "replace"
+    | "delete"
+    | "triggerVideo"
+    | "controlAudio"
+    | "authorVisibility"
+    | "authorDelete";
   elementId?: string;
   elementIds?: string[];
   payload: Record<string, unknown>;
@@ -62,13 +72,31 @@ export class BoardSyncQueue {
       });
     }
 
-    // If replacing the entire board, supersede older mutations except triggered videos
+    // Coalesce consecutive controlAudio calls on the same elementId
+    if (action.kind === "controlAudio" && action.elementId) {
+      const existingIdx = this.queue.findIndex(
+        (item) => item.kind === "controlAudio" && item.elementId === action.elementId
+      );
+      if (existingIdx >= 0) {
+        this.queue[existingIdx] = action;
+        void this.pump();
+        return;
+      }
+    }
+
+    // If replacing the entire board, supersede older mutations except triggered videos/audios
     if (action.kind === "replace") {
-      this.queue = this.queue.filter((item) => item.kind === "triggerVideo");
+      this.queue = this.queue.filter(
+        (item) => item.kind === "triggerVideo" || item.kind === "controlAudio"
+      );
     }
 
     this.queue.push(action);
     void this.pump();
+  }
+
+  hasPendingWork(): boolean {
+    return this.flushing || this.queue.length > 0;
   }
 
   private async pump(): Promise<void> {

@@ -6,16 +6,28 @@ import { buildAnimationStyle } from "@/lib/animations";
 import { ensureCustomFontLoaded, resolveFontFamilyCss } from "@/lib/fonts";
 import { buildBrushStrokeData } from "@/lib/geometry";
 import type { BoardElement } from "@/types/board";
+import {
+  AudioElementNode,
+  type AudioControlUpdate,
+} from "./AudioElementNode";
 import { VideoElementNode } from "./VideoElementNode";
 
 interface StageElementProps {
   element: BoardElement;
   mode: "editor" | "obs" | "thumbnail";
+  zoom?: number;
+  canEdit?: boolean;
   isEditingText?: boolean;
   onTextChange?: (nextText: string) => void;
   onTextResize?: (nextHeight: number) => void;
   onTextBlur?: () => void;
   onVideoAutoHide?: (elementId: string) => void;
+  onAudioControl?: (elementId: string, update: AudioControlUpdate) => void;
+  onAudioWaveformDecoded?: (
+    elementId: string,
+    peaks: number[],
+    durationSec?: number
+  ) => void;
   onPointerDown?: (e: React.PointerEvent) => void;
   onDoubleClick?: (e: React.MouseEvent) => void;
 }
@@ -36,11 +48,15 @@ function getStrokeDashArray(
 const StageElementInner: React.FC<StageElementProps> = ({
   element,
   mode,
+  zoom = 1,
+  canEdit = true,
   isEditingText = false,
   onTextChange,
   onTextResize,
   onTextBlur,
   onVideoAutoHide,
+  onAudioControl,
+  onAudioWaveformDecoded,
   onPointerDown,
   onDoubleClick,
 }) => {
@@ -79,14 +95,21 @@ const StageElementInner: React.FC<StageElementProps> = ({
     }
   }, [element.visible, element.animation?.exit, element.animation?.exitDurationMs, mode]);
 
-  // Auto-focus & select text when entering edit mode
+  // Auto-focus & select text when entering edit mode (scheduled on RAF so pointerup never steals focus)
   useEffect(() => {
-    if (isEditingText && textareaRef.current) {
-      textareaRef.current.focus();
-      if (textareaRef.current.value === "Escribe aquí…") {
-        textareaRef.current.select();
+    if (!isEditingText) return;
+    const raf = requestAnimationFrame(() => {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      ta.focus();
+      if (ta.value === "Escribe aquí…" || ta.value === "Nuevo texto") {
+        ta.select();
+      } else {
+        const len = ta.value.length;
+        ta.setSelectionRange(len, len);
       }
-    }
+    });
+    return () => cancelAnimationFrame(raf);
   }, [isEditingText]);
 
   const brushType = element.brushType ?? "pen";
@@ -112,6 +135,12 @@ const StageElementInner: React.FC<StageElementProps> = ({
     element.brushTaper,
   ]);
 
+  // Audio elements in OBS stream are 100% invisible — ONLY audio plays!
+  if (element.type === "audio" && mode === "obs") {
+    if (!element.src) return null;
+    return <AudioElementNode element={element} mode="obs" />;
+  }
+
   // In OBS and thumbnails, hidden elements are completely invisible after any exit animation
   if (!element.visible && mode !== "editor" && !exitingInObs) {
     return null;
@@ -120,6 +149,7 @@ const StageElementInner: React.FC<StageElementProps> = ({
   const strokeColor = element.strokeColor ?? "#ffffff";
   const fillColor = element.fillColor ?? "transparent";
   const strokeWidth = element.strokeWidth ?? 4;
+  const hitStrokeWidth = Math.max(22 / Math.max(0.2, zoom), strokeWidth * 2.2);
   const dashArray = getStrokeDashArray(element.strokeStyle, strokeWidth);
 
   const isGhostHidden = mode === "editor" && !element.visible;
@@ -189,7 +219,17 @@ const StageElementInner: React.FC<StageElementProps> = ({
 
   return (
     <div
-      style={wrapperStyle}
+      style={{
+        ...wrapperStyle,
+        cursor:
+          canInteractInEditor && !isVectorHit
+            ? isEditingText
+              ? "text"
+              : "move"
+            : undefined,
+      }}
+      draggable={false}
+      onDragStart={(e) => e.preventDefault()}
       onPointerDown={
         canInteractInEditor && !isVectorHit ? onPointerDown : undefined
       }
@@ -262,7 +302,7 @@ const StageElementInner: React.FC<StageElementProps> = ({
                 d={strokeData.centerlinePath || strokeData.path}
                 fill="none"
                 stroke="transparent"
-                strokeWidth={Math.max(18, strokeWidth * 2.2)}
+                strokeWidth={hitStrokeWidth}
                 strokeLinecap="round"
                 strokeLinejoin="round"
                 style={{ pointerEvents: "stroke", cursor: "move" }}
@@ -343,7 +383,7 @@ const StageElementInner: React.FC<StageElementProps> = ({
                 ry={element.borderRadius ?? 12}
                 fill="none"
                 stroke="transparent"
-                strokeWidth={Math.max(16, strokeWidth + 12)}
+                strokeWidth={hitStrokeWidth}
                 style={{ pointerEvents: "stroke", cursor: "move" }}
                 onPointerDown={onPointerDown}
                 onDoubleClick={onDoubleClick}
@@ -391,7 +431,7 @@ const StageElementInner: React.FC<StageElementProps> = ({
                 ry={Math.max(1, (element.height - strokeWidth) / 2)}
                 fill="none"
                 stroke="transparent"
-                strokeWidth={Math.max(16, strokeWidth + 12)}
+                strokeWidth={hitStrokeWidth}
                 style={{ pointerEvents: "stroke", cursor: "move" }}
                 onPointerDown={onPointerDown}
                 onDoubleClick={onDoubleClick}
@@ -448,7 +488,7 @@ const StageElementInner: React.FC<StageElementProps> = ({
                     x2={x2}
                     y2={y2}
                     stroke="transparent"
-                    strokeWidth={Math.max(18, strokeWidth + 14)}
+                    strokeWidth={hitStrokeWidth}
                     strokeLinecap="round"
                     style={{ pointerEvents: "stroke", cursor: "move" }}
                     onPointerDown={onPointerDown}
@@ -563,7 +603,13 @@ const StageElementInner: React.FC<StageElementProps> = ({
               />
             ) : (
               <div className="w-full">
-                {element.text || (mode === "editor" ? "Doble clic para escribir" : "")}
+                {element.text ? (
+                  element.text
+                ) : mode === "editor" ? (
+                  <span className="opacity-45 italic">Haz clic para escribir…</span>
+                ) : (
+                  ""
+                )}
               </div>
             )}
           </div>
@@ -613,6 +659,16 @@ const StageElementInner: React.FC<StageElementProps> = ({
             element={element}
             mode={mode}
             onAutoHide={onVideoAutoHide}
+          />
+        )}
+
+        {element.type === "audio" && element.src && (
+          <AudioElementNode
+            element={element}
+            mode={mode}
+            canEdit={canEdit}
+            onAudioControl={onAudioControl}
+            onWaveformDecoded={onAudioWaveformDecoded}
           />
         )}
       </div>

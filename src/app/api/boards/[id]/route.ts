@@ -5,8 +5,10 @@ import {
   computeElementsHash,
   deleteBoard,
   getBoardForUser,
+  updateBoardBackground,
   updateBoardTitle,
 } from "@/lib/store";
+import type { BoardBackgroundConfig } from "@/types/board";
 
 export async function GET(
   req: Request,
@@ -27,7 +29,7 @@ export async function GET(
 
   const url = new URL(req.url);
   const clientHash = url.searchParams.get("hash");
-  const serverHash = computeElementsHash(board.elements);
+  const serverHash = computeElementsHash(board.elements, board.background);
 
   if (clientHash && clientHash === serverHash) {
     return NextResponse.json(
@@ -59,25 +61,50 @@ export async function PATCH(
   const { id } = await ctx.params;
   const body = (await req.json().catch(() => ({}))) as {
     title?: string;
+    background?: BoardBackgroundConfig;
     senderId?: string;
   };
-  if (typeof body.title !== "string") {
-    return NextResponse.json({ error: "Título requerido" }, { status: 400 });
+  if (typeof body.title !== "string" && body.background === undefined) {
+    return NextResponse.json(
+      { error: "Título o configuración de fondo requerida" },
+      { status: 400 }
+    );
   }
-  const res = await updateBoardTitle(id, user, body.title);
-  if (!res.ok) {
-    return NextResponse.json({ error: res.error }, { status: 403 });
+
+  let nextTitle: string | undefined;
+  let nextBackground: BoardBackgroundConfig | undefined;
+
+  if (typeof body.title === "string") {
+    const res = await updateBoardTitle(id, user, body.title);
+    if (!res.ok) {
+      return NextResponse.json({ error: res.error }, { status: 403 });
+    }
+    nextTitle = res.title;
   }
+
+  if (body.background !== undefined) {
+    const res = await updateBoardBackground(id, user, body.background);
+    if (!res.ok) {
+      return NextResponse.json({ error: res.error }, { status: 403 });
+    }
+    nextBackground = res.background;
+  }
+
   realtimeHub.broadcast(
     id,
     {
       type: "board:meta",
       senderId: body.senderId ?? user.id,
-      title: res.title!,
+      ...(nextTitle !== undefined ? { title: nextTitle } : {}),
+      ...(nextBackground !== undefined ? { background: nextBackground } : {}),
     },
     body.senderId
   );
-  return NextResponse.json({ ok: true, title: res.title });
+  return NextResponse.json({
+    ok: true,
+    ...(nextTitle !== undefined ? { title: nextTitle } : {}),
+    ...(nextBackground !== undefined ? { background: nextBackground } : {}),
+  });
 }
 
 export async function DELETE(

@@ -23,6 +23,14 @@ const MIME_MAP: Record<string, string> = {
   ".woff": "font/woff",
   ".woff2": "font/woff2",
   ".pdf": "application/pdf",
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
+  ".ogg": "audio/ogg",
+  ".m4a": "audio/mp4",
+  ".aac": "audio/aac",
+  ".flac": "audio/flac",
+  ".opus": "audio/opus",
+  ".weba": "audio/webm",
 };
 
 export async function GET(

@@ -18,7 +18,7 @@ export async function GET(
     );
   }
 
-  const serverHash = computeElementsHash(board.elements);
+  const serverHash = computeElementsHash(board.elements, board.background);
   if (clientHash && clientHash === serverHash) {
     return NextResponse.json(
       { unchanged: true, hash: serverHash },

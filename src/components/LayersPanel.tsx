@@ -4,6 +4,7 @@ import React, { useState } from "react";
 import {
   ArrowDown,
   ArrowUp,
+  AudioLines,
   Copy,
   Eye,
   EyeOff,
@@ -11,12 +12,15 @@ import {
   Film,
   Layers,
   Lock,
+  Pause,
+  Play,
   Trash2,
   Unlock,
   Zap,
 } from "lucide-react";
 import { buildBrushStrokeData } from "@/lib/geometry";
 import type { BoardElement } from "@/types/board";
+import type { AudioControlUpdate } from "./AudioElementNode";
 
 interface LayersPanelProps {
   elements: BoardElement[];
@@ -32,6 +36,7 @@ interface LayersPanelProps {
     id: string,
     opts?: { playing?: boolean; visible?: boolean; restart?: boolean }
   ) => void;
+  onControlAudio?: (id: string, update: AudioControlUpdate) => void;
   onHideAllVideos: () => void;
   onShowAllLayers: () => void;
 }
@@ -201,6 +206,17 @@ function LayerPreviewThumb({ element }: { element: BoardElement }) {
     );
   }
 
+  if (element.type === "audio") {
+    return (
+      <div className="w-9 h-6 rounded-md bg-black border border-orange-400/35 flex items-center justify-center shrink-0">
+        <AudioLines
+          className="w-3.5 h-3.5"
+          style={{ color: element.waveformColor ?? "#fb923c" }}
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="w-9 h-6 rounded-md bg-studio-950 border border-white/[0.1] flex items-center justify-center shrink-0">
       <Film className="w-3.5 h-3.5 text-sky-400" />
@@ -219,6 +235,7 @@ export const LayersPanel: React.FC<LayersPanelProps> = ({
   onMoveLayer,
   onReorderLayer,
   onTriggerVideo,
+  onControlAudio,
   onHideAllVideos,
   onShowAllLayers,
 }) => {
@@ -427,6 +444,28 @@ export const LayersPanel: React.FC<LayersPanelProps> = ({
                         <Trash2 className="w-3 h-3" />
                       </button>
                     </div>
+
+                    {el.type === "audio" && onControlAudio && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onControlAudio(el.id, {
+                            playing: !el.playing,
+                            currentTimeSec: el.currentTimeSec ?? 0,
+                            commit: true,
+                          })
+                        }
+                        title={el.playing ? "Pausar audio" : "Reproducir audio"}
+                        aria-label={el.playing ? "Pausar audio" : "Reproducir audio"}
+                        className="p-1 rounded-md text-orange-400 hover:bg-orange-500/20 transition-colors"
+                      >
+                        {el.playing ? (
+                          <Pause className="w-3.5 h-3.5" />
+                        ) : (
+                          <Play className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                    )}
 
                     {el.type === "video" && (
                       <button

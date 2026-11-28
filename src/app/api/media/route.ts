@@ -27,6 +27,22 @@ const ALLOWED_IMAGE_MIMES = new Set([
   "image/avif",
 ]);
 
+const ALLOWED_AUDIO_MIMES = new Set([
+  "audio/mpeg",
+  "audio/mp3",
+  "audio/wav",
+  "audio/x-wav",
+  "audio/wave",
+  "audio/ogg",
+  "audio/mp4",
+  "audio/x-m4a",
+  "audio/aac",
+  "audio/flac",
+  "audio/webm",
+  "audio/opus",
+]);
+
+const ALLOWED_AUDIO_EXT = /\.(mp3|wav|ogg|m4a|aac|flac|opus|weba)$/i;
 const ALLOWED_FONT_EXT = /\.(ttf|otf|woff|woff2)$/i;
 
 export async function GET(req: Request) {
@@ -77,6 +93,7 @@ export async function POST(req: Request) {
 
       const validKind: MediaAsset["kind"] =
         body.kind === "video" ||
+        body.kind === "audio" ||
         body.kind === "document" ||
         body.kind === "font"
           ? body.kind
@@ -150,17 +167,21 @@ export async function POST(req: Request) {
     const isImage =
       ALLOWED_IMAGE_MIMES.has(mimeType) ||
       /\.(png|jpe?g|webp|gif|svg|avif)$/i.test(lowerName);
+    const isAudio =
+      ALLOWED_AUDIO_MIMES.has(mimeType) ||
+      mimeType.startsWith("audio/") ||
+      ALLOWED_AUDIO_EXT.test(lowerName);
     const isFont =
       ALLOWED_FONT_EXT.test(lowerName) ||
       mimeType.startsWith("font/") ||
       mimeType === "application/font-woff" ||
       mimeType === "application/x-font-ttf";
 
-    if (!isVideo && !isImage && !isFont) {
+    if (!isVideo && !isImage && !isAudio && !isFont) {
       return NextResponse.json(
         {
           error:
-            "Formato no soportado. Usa videos (MP4, WebM, MOV), imágenes (PNG, JPG, WebP, GIF) o fuentes (TTF, OTF, WOFF, WOFF2).",
+            "Formato no soportado. Usa videos (MP4, WebM, MOV), audios (MP3, WAV, OGG, M4A), imágenes (PNG, JPG, WebP, GIF) o fuentes (TTF, OTF, WOFF, WOFF2).",
         },
         { status: 400 }
       );
@@ -168,24 +189,36 @@ export async function POST(req: Request) {
 
     const kind: MediaAsset["kind"] = isVideo
       ? "video"
-      : isFont
-        ? "font"
-        : "image";
+      : isAudio
+        ? "audio"
+        : isFont
+          ? "font"
+          : "image";
     const resolvedMime =
       mimeType ||
       (isVideo
         ? lowerName.endsWith(".webm")
           ? "video/webm"
           : "video/mp4"
-        : isFont
-          ? lowerName.endsWith(".woff2")
-            ? "font/woff2"
-            : lowerName.endsWith(".woff")
-              ? "font/woff"
-              : lowerName.endsWith(".otf")
-                ? "font/otf"
-                : "font/ttf"
-          : "image/png");
+        : isAudio
+          ? lowerName.endsWith(".wav")
+            ? "audio/wav"
+            : lowerName.endsWith(".ogg")
+              ? "audio/ogg"
+              : lowerName.endsWith(".m4a")
+                ? "audio/mp4"
+                : lowerName.endsWith(".flac")
+                  ? "audio/flac"
+                  : "audio/mpeg"
+          : isFont
+            ? lowerName.endsWith(".woff2")
+              ? "font/woff2"
+              : lowerName.endsWith(".woff")
+                ? "font/woff"
+                : lowerName.endsWith(".otf")
+                  ? "font/otf"
+                  : "font/ttf"
+            : "image/png");
 
     const nameField = formData.get("name");
     const customName =

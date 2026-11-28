@@ -15,6 +15,7 @@ import {
   Radio,
   Share2,
   ShieldAlert,
+  UploadCloud,
   WifiOff,
 } from "lucide-react";
 import { uploadMediaFile } from "@/lib/client-media-upload";
@@ -43,6 +44,7 @@ import { BoardSyncQueue } from "@/lib/sync-queue";
 import {
   STAGE_HEIGHT,
   STAGE_WIDTH,
+  type BoardBackgroundConfig,
   type BoardDetail,
   type BoardElement,
   type BoardMember,
@@ -57,6 +59,7 @@ import {
   type ToolType,
   type User,
 } from "@/types/board";
+import { type AudioControlUpdate } from "./AudioElementNode";
 import { BrandLogo } from "./BrandLogo";
 import { CollaboratorsBar } from "./CollaboratorsBar";
 import { DocumentAttachModal } from "./DocumentAttachModal";
@@ -106,8 +109,11 @@ type InteractionState =
   | {
       kind: "move";
       pointerId: number;
+      startClientX: number;
+      startClientY: number;
       startStageX: number;
       startStageY: number;
+      clickedElementId?: string;
       items: Array<{ id: string; origX: number; origY: number }>;
       moved: boolean;
     }
@@ -191,7 +197,15 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
   const [editingTextId, setEditingTextId] = useState<string | null>(null);
 
   const [tool, setTool] = useState<ToolType>("select");
-  const [backdrop, setBackdrop] = useState<EditorBackdrop>("checker-dark");
+  const [boardBackground, setBoardBackground] = useState<BoardBackgroundConfig>(
+    initialBoard.background ?? {}
+  );
+  const [backdrop, setBackdrop] = useState<EditorBackdrop>(
+    initialBoard.background?.imageUrl ? "custom-image" : "checker-dark"
+  );
+  const [uploadingBgPhoto, setUploadingBgPhoto] = useState(false);
+  const [externalDragCount, setExternalDragCount] = useState(0);
+  const [dropUploadLabel, setDropUploadLabel] = useState<string | null>(null);
   const [showLeftPanel, setShowLeftPanel] = useState(true);
   const [showRightPanel, setShowRightPanel] = useState(true);
   const [shareOpen, setShareOpen] = useState(false);
@@ -239,6 +253,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     brushSmoothing: 0.55,
     brushTaper: 0,
     opacity: 1,
+    defaultText: "",
     fontFamily: "Plus Jakarta Sans",
     fontSize: 42,
     textBgColor: "rgba(16, 19, 28, 0.8)",
@@ -275,6 +290,25 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
   elementsRef.current = elements;
   const selectedIdsRef = useRef<string[]>(selectedIds);
   selectedIdsRef.current = selectedIds;
+  const editingTextIdRef = useRef<string | null>(editingTextId);
+  editingTextIdRef.current = editingTextId;
+
+  const bgStorageKey = `oboards_bg_${initialBoard.id}`;
+  useEffect(() => {
+    if (initialBoard.background?.imageUrl) return;
+    try {
+      const raw = localStorage.getItem(bgStorageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw) as BoardBackgroundConfig;
+        if (parsed?.imageUrl) {
+          setBoardBackground(parsed);
+          setBackdrop("custom-image");
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }, [bgStorageKey, initialBoard.background?.imageUrl]);
 
   const lastCursorSentRef = useRef(0);
   const lastLiveBroadcastRef = useRef(0);
@@ -487,6 +521,15 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
   // Lightweight reconciliation + permission check
   const resyncBoardSnapshot = useCallback(
     async (force = false) => {
+      // Never overwrite elements mid-interaction, mid-text-edit, or while local writes are still syncing
+      if (
+        !force &&
+        (interactionRef.current.kind !== "none" ||
+          editingTextIdRef.current !== null ||
+          syncQueueRef.current?.hasPendingWork())
+      ) {
+        return;
+      }
       try {
         const hashParam =
           !force && lastHashRef.current
@@ -513,12 +556,22 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         if (data.myRole) setMyRole(data.myRole);
         if (typeof data.myPaused === "boolean") setMyPaused(data.myPaused);
         if (data.members) setMembers(data.members);
-        if (!data.unchanged && data.board) {
+        if (
+          !data.unchanged &&
+          data.board &&
+          (force ||
+            (interactionRef.current.kind === "none" &&
+              editingTextIdRef.current === null &&
+              !syncQueueRef.current?.hasPendingWork()))
+        ) {
           setElements(data.board.elements);
           setMembers(data.board.members);
           setMyRole(data.board.myRole);
           setMyPaused(Boolean(data.board.myPaused));
           setTitle(data.board.title);
+          if (data.board.background !== undefined) {
+            setBoardBackground(data.board.background ?? {});
+          }
           setRemoteDrafts({});
         }
       } catch {
@@ -864,8 +917,33 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
               )
             );
             break;
+          case "audio:control":
+            setElements((prev) =>
+              prev.map((e) =>
+                e.id === event.elementId
+                  ? {
+                      ...e,
+                      playing: event.playing,
+                      currentTimeSec: event.currentTimeSec,
+                      triggeredAt: event.triggeredAt,
+                      seekId: event.seekId,
+                      loop: event.loop !== undefined ? event.loop : e.loop,
+                      muted: event.muted !== undefined ? event.muted : e.muted,
+                      volume:
+                        event.volume !== undefined ? event.volume : e.volume,
+                    }
+                  : e
+              )
+            );
+            break;
           case "board:meta":
-            setTitle(event.title);
+            if (event.title !== undefined) setTitle(event.title);
+            if (event.background !== undefined) {
+              setBoardBackground(event.background ?? {});
+              if (event.background?.imageUrl) {
+                setBackdrop("custom-image");
+              }
+            }
             break;
           case "cursor:move":
             setRemoteCursors((prev) => ({
@@ -986,12 +1064,40 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     user.name,
   ]);
 
-  // Global window blur safeguard (prevents sticky pointer drags if alt-tabbed)
+  // Global window blur & visibility safeguard (prevents sticky spacebar or stuck drags)
   useEffect(() => {
-    const onBlur = () => cancelActiveInteraction();
+    const onBlur = () => {
+      setSpacePressed(false);
+      cancelActiveInteraction();
+    };
+    const onVisChange = () => {
+      if (document.visibilityState !== "visible") {
+        setSpacePressed(false);
+        cancelActiveInteraction();
+      }
+    };
     window.addEventListener("blur", onBlur);
-    return () => window.removeEventListener("blur", onBlur);
+    document.addEventListener("visibilitychange", onVisChange);
+    return () => {
+      window.removeEventListener("blur", onBlur);
+      document.removeEventListener("visibilitychange", onVisChange);
+    };
   }, [cancelActiveInteraction]);
+
+  // Prevent browser from opening dropped files in the tab if dropped outside a specific zone
+  useEffect(() => {
+    const preventFileNav = (e: DragEvent) => {
+      if (e.dataTransfer?.types?.includes("Files")) {
+        e.preventDefault();
+      }
+    };
+    window.addEventListener("dragover", preventFileNav);
+    window.addEventListener("drop", preventFileNav);
+    return () => {
+      window.removeEventListener("dragover", preventFileNav);
+      window.removeEventListener("drop", preventFileNav);
+    };
+  }, []);
 
   // Element Mutations
   const handlePatchElement = useCallback(
@@ -1199,6 +1305,162 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     [canEdit, clientId]
   );
 
+  const handleControlAudio = useCallback(
+    (elementId: string, update: AudioControlUpdate) => {
+      if (!canEdit) return;
+      const el = elementsRef.current.find((e) => e.id === elementId);
+      if (!el || el.type !== "audio") return;
+
+      const now = Date.now();
+      const nextSeekId = `ask_${nanoid(8)}`;
+      const nextLoop = update.loop !== undefined ? update.loop : el.loop;
+      const nextMuted = update.muted !== undefined ? update.muted : el.muted;
+      const nextVolume = update.volume !== undefined ? update.volume : el.volume;
+
+      setElements((prev) =>
+        prev.map((item) =>
+          item.id === elementId
+            ? {
+                ...item,
+                playing: update.playing,
+                currentTimeSec: update.currentTimeSec,
+                triggeredAt: now,
+                seekId: nextSeekId,
+                loop: nextLoop,
+                muted: nextMuted,
+                volume: nextVolume,
+                updatedAt: now,
+              }
+            : item
+        )
+      );
+
+      const evt: RealtimeEvent = {
+        type: "audio:control",
+        senderId: clientId,
+        elementId,
+        playing: update.playing,
+        currentTimeSec: update.currentTimeSec,
+        triggeredAt: now,
+        seekId: nextSeekId,
+        loop: nextLoop,
+        muted: nextMuted,
+        volume: nextVolume,
+      };
+
+      if (update.commit === false) {
+        realtimeRef.current?.sendEphemeral(evt);
+        return;
+      }
+
+      realtimeRef.current?.sendPersistedBroadcast(evt);
+      syncQueueRef.current?.enqueue({
+        kind: "controlAudio",
+        elementId,
+        payload: {
+          action: "controlAudio",
+          senderId: clientId,
+          elementId,
+          playing: update.playing,
+          currentTimeSec: update.currentTimeSec,
+          triggeredAt: now,
+          seekId: nextSeekId,
+          loop: nextLoop,
+          muted: nextMuted,
+          volume: nextVolume,
+        },
+      });
+    },
+    [canEdit, clientId]
+  );
+
+  const handleAudioWaveformDecoded = useCallback(
+    (elementId: string, peaks: number[], durationSec?: number) => {
+      const patch: Partial<BoardElement> = { waveformPeaks: peaks };
+      if (durationSec && durationSec > 0) patch.durationSec = durationSec;
+      setElements((prev) =>
+        prev.map((e) => (e.id === elementId ? { ...e, ...patch } : e))
+      );
+      if (canEdit) {
+        persistPatch(elementId, patch);
+      }
+    },
+    [canEdit, persistPatch]
+  );
+
+  const handleUpdateBoardBackground = useCallback(
+    async (nextBg: BoardBackgroundConfig) => {
+      if (!canEdit) return;
+      setBoardBackground(nextBg);
+      try {
+        if (nextBg.imageUrl) {
+          localStorage.setItem(bgStorageKey, JSON.stringify(nextBg));
+        } else {
+          localStorage.removeItem(bgStorageKey);
+        }
+      } catch {
+        // ignore
+      }
+      realtimeRef.current?.sendPersistedBroadcast({
+        type: "board:meta",
+        senderId: clientId,
+        background: nextBg,
+      });
+      try {
+        await fetch(`/api/boards/${encodeURIComponent(initialBoard.id)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ background: nextBg, senderId: clientId }),
+        });
+      } catch {
+        // ignore transient network errors
+      }
+    },
+    [bgStorageKey, canEdit, clientId, initialBoard.id]
+  );
+
+  const handleUploadBgPhoto = useCallback(
+    async (file: File) => {
+      if (!canEdit) return;
+      setUploadingBgPhoto(true);
+      try {
+        const res = await uploadMediaFile(file, { boardId: initialBoard.id });
+        if (res.error || !res.asset) {
+          setSaveError(res.error || "No se pudo subir la foto de fondo.");
+          return;
+        }
+        if (res.asset.kind !== "image") {
+          setSaveError("Selecciona una imagen (PNG, JPG, WebP, GIF) para el fondo.");
+          return;
+        }
+        setAssets((prev) => [
+          res.asset!,
+          ...prev.filter((a) => a.id !== res.asset!.id),
+        ]);
+        broadcastLibraryUpdated();
+        const nextBg: BoardBackgroundConfig = {
+          imageUrl: res.asset.url,
+          fit: boardBackground.fit ?? "cover",
+          opacity: boardBackground.opacity ?? 1,
+          showInObs: boardBackground.showInObs ?? false,
+        };
+        setBackdrop("custom-image");
+        await handleUpdateBoardBackground(nextBg);
+      } finally {
+        setUploadingBgPhoto(false);
+      }
+    },
+    [
+      boardBackground.fit,
+      boardBackground.opacity,
+      boardBackground.showInObs,
+      broadcastLibraryUpdated,
+      canEdit,
+      handleUpdateBoardBackground,
+      initialBoard.id,
+    ]
+  );
+
   const handleInsertAsset = useCallback(
     (
       asset: MediaAsset,
@@ -1210,6 +1472,54 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
 
       pushUndoSnapshot();
       const now = Date.now();
+
+      if (asset.kind === "audio") {
+        const width = 540;
+        const height = 220;
+        const x = dropPos
+          ? Math.round(dropPos.x - width / 2)
+          : Math.round((STAGE_WIDTH - width) / 2);
+        const y = dropPos
+          ? Math.round(dropPos.y - height / 2)
+          : Math.round((STAGE_HEIGHT - height) / 2);
+
+        const audioEl: BoardElement = {
+          id: `el_${nanoid(12)}`,
+          boardId: initialBoard.id,
+          type: "audio",
+          name: getNextElementName("audio", elementsRef.current, asset.name),
+          x,
+          y,
+          width,
+          height,
+          rotation: 0,
+          zIndex: getNextZIndex(elementsRef.current),
+          visible: true,
+          locked: false,
+          opacity: 1,
+          src: asset.url,
+          mediaAssetId: asset.id,
+          durationSec: asset.durationSec,
+          currentTimeSec: 0,
+          seekId: `ask_${nanoid(8)}`,
+          triggeredAt: now,
+          waveformPeaks: asset.metadata?.waveformPeaks,
+          waveformColor: "#fb923c",
+          playing: false,
+          loop: options.loop,
+          muted: options.muted,
+          volume: 0.85,
+          createdByUserId: user.id,
+          createdByEmail: user.email,
+          createdByName: user.name,
+          updatedAt: now,
+        };
+        setElements((prev) => [...prev, audioEl]);
+        setSelectedIds([audioEl.id]);
+        setTool("select");
+        persistUpsert(audioEl);
+        return;
+      }
 
       if (asset.kind === "document" && asset.metadata?.documentPages?.length) {
         const first = asset.metadata.documentPages[0];
@@ -1711,7 +2021,12 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       else if (key === "o" && canEdit) setTool("ellipse");
       else if (key === "l" && canEdit) setTool("line");
       else if (key === "a" && canEdit) setTool("arrow");
-      else if (key === "t" && canEdit) setTool("text");
+      else if (key === "t" && canEdit) {
+        setTool("text");
+        setSelectedIds([]);
+        setEditingTextId(null);
+        setShowRightPanel(true);
+      }
       else if (key === "m") setSnapEnabled((v) => !v);
       else if (key === "g")
         setGuidesConfig((prev) => ({ ...prev, enabled: !prev.enabled }));
@@ -1777,88 +2092,37 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     }
   };
 
-  // Pointer handlers
-  const handleStagePointerDown = (e: React.PointerEvent) => {
-    // Middle click or Space+Click pans canvas
-    if (e.button === 1 || (e.button === 0 && spacePressed)) {
-      e.preventDefault();
-      interactionRef.current = {
-        kind: "pan",
-        pointerId: e.pointerId,
-        startClientX: e.clientX,
-        startClientY: e.clientY,
-        startPanX: cameraRef.current.x,
-        startPanY: cameraRef.current.y,
-      };
-      viewportRef.current?.setPointerCapture(e.pointerId);
-      return;
+  const capturePointerSafe = useCallback((pointerId: number) => {
+    try {
+      viewportRef.current?.setPointerCapture(pointerId);
+    } catch {
+      // Window-level pointer listeners guarantee drag completion even without capture
     }
+  }, []);
 
-    if (e.button !== 0) return;
-
-    const pt = screenToStage(e.clientX, e.clientY);
-
-    // Select tool on empty canvas -> Marquee drag selection
-    if (tool === "select") {
-      setEditingTextId(null);
-      const additive = e.shiftKey || e.ctrlKey || e.metaKey;
-      const base = additive ? [...selectedIdsRef.current] : [];
-      if (!additive) setSelectedIds([]);
-      setMarqueeBox({ x: pt.x, y: pt.y, width: 0, height: 0 });
-      interactionRef.current = {
-        kind: "marquee",
-        pointerId: e.pointerId,
-        startX: pt.x,
-        startY: pt.y,
-        curX: pt.x,
-        curY: pt.y,
-        additive,
-        baseSelectedIds: base,
-      };
-      viewportRef.current?.setPointerCapture(e.pointerId);
-      return;
-    }
-
-    if (!canEdit) return;
-
-    // Eraser tool
-    if (tool === "eraser") {
-      const hitSet = new Set<string>();
-      const radius = drawDefaults.eraserSize / 2;
-      for (const el of elementsRef.current) {
-        if (!el.locked && doesCircleHitElement(pt.x, pt.y, radius, el)) {
-          hitSet.add(el.id);
-        }
-      }
-      setEraserPreviewIds(new Set(hitSet));
-      interactionRef.current = {
-        kind: "erase",
-        pointerId: e.pointerId,
-        trail: [{ x: pt.x, y: pt.y }],
-        hitIds: hitSet,
-      };
-      viewportRef.current?.setPointerCapture(e.pointerId);
-      return;
-    }
-
-    // Text tool
-    if (tool === "text") {
+  const createTextElement = useCallback(
+    (x: number, y: number, customText?: string) => {
+      if (!canEdit) return;
       pushUndoSnapshot();
+      const textVal =
+        customText !== undefined
+          ? customText
+          : drawDefaults.defaultText.trim() || "Nuevo texto";
       const newText: BoardElement = {
         id: `el_${nanoid(12)}`,
         boardId: initialBoard.id,
         type: "text",
         name: getNextElementName("text", elementsRef.current),
-        x: Math.round(pt.x),
-        y: Math.round(pt.y),
-        width: 380,
-        height: 88,
+        x: Math.round(x),
+        y: Math.round(y),
+        width: 420,
+        height: 92,
         rotation: 0,
         zIndex: getNextZIndex(elementsRef.current),
         visible: true,
         locked: false,
         opacity: drawDefaults.opacity,
-        text: "Escribe aquí…",
+        text: textVal,
         fontSize: drawDefaults.fontSize,
         fontFamily: drawDefaults.fontFamily,
         customFontName: drawDefaults.customFontName,
@@ -1875,14 +2139,106 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       };
       setElements((prev) => [...prev, newText]);
       setSelectedIds([newText.id]);
+      setShowRightPanel(true);
       setEditingTextId(newText.id);
       setTool("select");
       persistUpsert(newText);
+    },
+    [
+      canEdit,
+      drawDefaults,
+      initialBoard.id,
+      persistUpsert,
+      pushUndoSnapshot,
+      user.email,
+      user.id,
+      user.name,
+    ]
+  );
+
+  const handleInsertTextFromPanel = useCallback(
+    (text: string) => {
+      createTextElement((STAGE_WIDTH - 420) / 2, (STAGE_HEIGHT - 92) / 2, text);
+    },
+    [createTextElement]
+  );
+
+  // Pointer handlers
+  const handleStagePointerDown = (e: React.PointerEvent) => {
+    // Middle click or Space+Click pans canvas
+    if (e.button === 1 || (e.button === 0 && spacePressed)) {
+      e.preventDefault();
+      interactionRef.current = {
+        kind: "pan",
+        pointerId: e.pointerId,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startPanX: cameraRef.current.x,
+        startPanY: cameraRef.current.y,
+      };
+      capturePointerSafe(e.pointerId);
+      return;
+    }
+
+    if (e.button !== 0) return;
+
+    const pt = screenToStage(e.clientX, e.clientY);
+
+    // Select tool on empty canvas -> Marquee drag selection
+    if (tool === "select") {
+      e.preventDefault();
+      setEditingTextId(null);
+      const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+      const base = additive ? [...selectedIdsRef.current] : [];
+      if (!additive) setSelectedIds([]);
+      setMarqueeBox({ x: pt.x, y: pt.y, width: 0, height: 0 });
+      interactionRef.current = {
+        kind: "marquee",
+        pointerId: e.pointerId,
+        startX: pt.x,
+        startY: pt.y,
+        curX: pt.x,
+        curY: pt.y,
+        additive,
+        baseSelectedIds: base,
+      };
+      capturePointerSafe(e.pointerId);
+      return;
+    }
+
+    if (!canEdit) return;
+
+    // Eraser tool
+    if (tool === "eraser") {
+      e.preventDefault();
+      const hitSet = new Set<string>();
+      const radius = drawDefaults.eraserSize / 2;
+      for (const el of elementsRef.current) {
+        if (!el.locked && doesCircleHitElement(pt.x, pt.y, radius, el)) {
+          hitSet.add(el.id);
+        }
+      }
+      setEraserPreviewIds(new Set(hitSet));
+      interactionRef.current = {
+        kind: "erase",
+        pointerId: e.pointerId,
+        trail: [{ x: pt.x, y: pt.y }],
+        hitIds: hitSet,
+      };
+      capturePointerSafe(e.pointerId);
+      return;
+    }
+
+    // Text tool
+    if (tool === "text") {
+      e.preventDefault();
+      createTextElement(pt.x, pt.y);
       return;
     }
 
     // Brush / Freehand tool
     if (tool === "freehand") {
+      e.preventDefault();
       const id = `el_${nanoid(12)}`;
       const firstPt: StrokePoint = {
         x: pt.x,
@@ -1927,7 +2283,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         elementId: id,
         rawPoints: [firstPt],
       };
-      viewportRef.current?.setPointerCapture(e.pointerId);
+      capturePointerSafe(e.pointerId);
       return;
     }
 
@@ -1938,6 +2294,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       tool === "line" ||
       tool === "arrow"
     ) {
+      e.preventDefault();
       const id = `el_${nanoid(12)}`;
       const draft: BoardElement = {
         id,
@@ -1977,7 +2334,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         startX: pt.x,
         startY: pt.y,
       };
-      viewportRef.current?.setPointerCapture(e.pointerId);
+      capturePointerSafe(e.pointerId);
     }
   };
 
@@ -1985,9 +2342,22 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     e: React.PointerEvent,
     el: BoardElement
   ) => {
-    if (tool !== "select" || spacePressed || e.button !== 0) return;
+    if (spacePressed || e.button !== 0) return;
+
+    // Clicking an existing text element while Text tool is active -> edit it directly!
+    if (tool === "text" && el.type === "text" && canEdit && !el.locked) {
+      e.stopPropagation();
+      e.preventDefault();
+      setSelectedIds([el.id]);
+      setEditingTextId(el.id);
+      setTool("select");
+      return;
+    }
+
+    if (tool !== "select") return;
     if (editingTextId === el.id) return;
     e.stopPropagation();
+    e.preventDefault();
 
     const additive = e.shiftKey || e.ctrlKey || e.metaKey;
     let nextSelected: string[];
@@ -2023,12 +2393,15 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     interactionRef.current = {
       kind: "move",
       pointerId: e.pointerId,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
       startStageX: pt.x,
       startStageY: pt.y,
+      clickedElementId: el.id,
       items: itemsToMove,
       moved: false,
     };
-    viewportRef.current?.setPointerCapture(e.pointerId);
+    capturePointerSafe(e.pointerId);
   };
 
   const handleResizePointerDown = (
@@ -2038,6 +2411,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
   ) => {
     if (!canEdit || el.locked || e.button !== 0) return;
     e.stopPropagation();
+    e.preventDefault();
     const pt = screenToStage(e.clientX, e.clientY);
     pushUndoSnapshot();
     interactionRef.current = {
@@ -2060,12 +2434,13 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       keepAspect:
         el.type === "image" || el.type === "video" || el.type === "document",
     };
-    viewportRef.current?.setPointerCapture(e.pointerId);
+    capturePointerSafe(e.pointerId);
   };
 
   const handleRotatePointerDown = (e: React.PointerEvent, el: BoardElement) => {
     if (!canEdit || el.locked || e.button !== 0) return;
     e.stopPropagation();
+    e.preventDefault();
     const pt = screenToStage(e.clientX, e.clientY);
     const centerX = el.x + el.width / 2;
     const centerY = el.y + el.height / 2;
@@ -2080,7 +2455,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       startAngle,
       origRotation: el.rotation ?? 0,
     };
-    viewportRef.current?.setPointerCapture(e.pointerId);
+    capturePointerSafe(e.pointerId);
   };
 
   const finishInteraction = useCallback(
@@ -2108,22 +2483,38 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         return;
       }
 
-      if (inter.kind === "move" && inter.moved) {
-        const patches: Array<{ elementId: string; patch: Partial<BoardElement> }> =
-          [];
-        for (const item of inter.items) {
-          const finalEl = elementsRef.current.find((el) => el.id === item.id);
-          if (finalEl) {
-            patches.push({
-              elementId: finalEl.id,
-              patch: { x: finalEl.x, y: finalEl.y },
-            });
+      if (inter.kind === "move") {
+        if (inter.moved) {
+          const patches: Array<{ elementId: string; patch: Partial<BoardElement> }> =
+            [];
+          for (const item of inter.items) {
+            const finalEl = elementsRef.current.find((el) => el.id === item.id);
+            if (finalEl) {
+              patches.push({
+                elementId: finalEl.id,
+                patch: { x: finalEl.x, y: finalEl.y },
+              });
+            }
           }
-        }
-        if (patches.length === 1) {
-          persistPatch(patches[0].elementId, patches[0].patch);
-        } else if (patches.length > 1) {
-          persistBatchPatch(patches);
+          if (patches.length === 1) {
+            persistPatch(patches[0].elementId, patches[0].patch);
+          } else if (patches.length > 1) {
+            persistBatchPatch(patches);
+          }
+        } else if (inter.clickedElementId && canEdit) {
+          // Direct single click on a text element (without dragging) opens inline text editor!
+          const clickedEl = elementsRef.current.find(
+            (el) => el.id === inter.clickedElementId
+          );
+          if (
+            clickedEl &&
+            clickedEl.type === "text" &&
+            !clickedEl.locked &&
+            selectedIdsRef.current.length === 1 &&
+            selectedIdsRef.current[0] === clickedEl.id
+          ) {
+            setEditingTextId(clickedEl.id);
+          }
         }
         return;
       }
@@ -2264,6 +2655,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
       }
     },
     [
+      canEdit,
       clientId,
       drawDefaults.eraserMode,
       drawDefaults.eraserSize,
@@ -2276,7 +2668,16 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     ]
   );
 
-  const handleStagePointerMove = (e: React.PointerEvent) => {
+  const handlePointerMoveCore = (e: {
+    clientX: number;
+    clientY: number;
+    pointerId: number;
+    pointerType: string;
+    buttons: number;
+    altKey: boolean;
+    shiftKey: boolean;
+    pressure: number;
+  }) => {
     const pt = screenToStage(e.clientX, e.clientY);
     const now = Date.now();
 
@@ -2375,7 +2776,11 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     if (inter.kind === "move") {
       const rawDx = pt.x - inter.startStageX;
       const rawDy = pt.y - inter.startStageY;
-      if (!inter.moved && (Math.abs(rawDx) > 2 || Math.abs(rawDy) > 2)) {
+      const screenDist = Math.hypot(
+        e.clientX - inter.startClientX,
+        e.clientY - inter.startClientY
+      );
+      if (!inter.moved && screenDist > 3) {
         pushUndoSnapshot();
         inter.moved = true;
       }
@@ -2655,9 +3060,116 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     }
   };
 
-  // Drop media asset, document, font, or external file onto canvas
+  // Window-level pointer fallback ensures dragging NEVER stalls or gets stuck even if pointer leaves canvas or loses capture
+  const pointerMoveCoreRef = useRef(handlePointerMoveCore);
+  pointerMoveCoreRef.current = handlePointerMoveCore;
+  const finishInteractionRef = useRef(finishInteraction);
+  finishInteractionRef.current = finishInteraction;
+
+  useEffect(() => {
+    const onWinMove = (e: PointerEvent) => {
+      if (interactionRef.current.kind === "none") return;
+      if (viewportRef.current?.hasPointerCapture(e.pointerId)) return;
+      pointerMoveCoreRef.current(e);
+    };
+    const onWinUp = (e: PointerEvent) => {
+      if (interactionRef.current.kind === "none") return;
+      finishInteractionRef.current(e.pointerId);
+    };
+    window.addEventListener("pointermove", onWinMove);
+    window.addEventListener("pointerup", onWinUp);
+    window.addEventListener("pointercancel", onWinUp);
+    return () => {
+      window.removeEventListener("pointermove", onWinMove);
+      window.removeEventListener("pointerup", onWinUp);
+      window.removeEventListener("pointercancel", onWinUp);
+    };
+  }, []);
+
+  const handleStagePointerMove = (e: React.PointerEvent) => {
+    handlePointerMoveCore(e);
+  };
+
+  // Unified external file import helper (works from dropping anywhere in the app!)
+  const importExternalFiles = useCallback(
+    async (files: FileList | File[], dropPos?: { x: number; y: number }) => {
+      if (!canEdit) return;
+      const list = Array.from(files);
+      if (list.length === 0) return;
+
+      let uploadedCount = 0;
+      setDropUploadLabel(
+        list.length === 1
+          ? `Importando ${list[0].name}…`
+          : `Importando ${list.length} archivos…`
+      );
+      try {
+        for (let i = 0; i < list.length; i++) {
+          const file = list[i];
+          const lower = file.name.toLowerCase();
+          if (
+            lower.endsWith(".pdf") ||
+            lower.endsWith(".txt") ||
+            lower.endsWith(".md") ||
+            file.type === "application/pdf"
+          ) {
+            setPendingDocFile(file);
+            setDocModalOpen(true);
+            continue;
+          }
+
+          const res = await uploadMediaFile(file, { boardId: initialBoard.id });
+          if (res.error) {
+            setSaveError(res.error);
+          } else if (res.asset) {
+            uploadedCount++;
+            setAssets((prev) => [
+              res.asset!,
+              ...prev.filter((a) => a.id !== res.asset!.id),
+            ]);
+            broadcastLibraryUpdated();
+            if (res.asset.kind === "font") {
+              handleApplyFontAsset(res.asset);
+            } else {
+              const staggeredPos = dropPos
+                ? { x: dropPos.x + i * 36, y: dropPos.y + i * 36 }
+                : {
+                    x: STAGE_WIDTH / 2 + i * 36,
+                    y: STAGE_HEIGHT / 2 + i * 36,
+                  };
+              handleInsertAsset(
+                res.asset,
+                {
+                  loop: false,
+                  autoHideOnEnd: res.asset.kind === "video",
+                  muted: false,
+                },
+                staggeredPos
+              );
+            }
+          }
+        }
+      } finally {
+        setDropUploadLabel(null);
+      }
+      if (uploadedCount > 0) {
+        setSaveError(null);
+      }
+    },
+    [
+      broadcastLibraryUpdated,
+      canEdit,
+      handleApplyFontAsset,
+      handleInsertAsset,
+      initialBoard.id,
+    ]
+  );
+
+  // Drop media asset, document, font, audio, or external file onto canvas
   const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
+    e.stopPropagation();
+    setExternalDragCount(0);
     if (!canEdit) return;
     const dropPos = screenToStage(e.clientX, e.clientY);
 
@@ -2677,35 +3189,44 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
 
     const files = e.dataTransfer.files;
     if (files && files.length > 0) {
-      for (const file of Array.from(files)) {
-        const lower = file.name.toLowerCase();
-        if (
-          lower.endsWith(".pdf") ||
-          lower.endsWith(".txt") ||
-          lower.endsWith(".md") ||
-          file.type === "application/pdf"
-        ) {
-          setPendingDocFile(file);
-          setDocModalOpen(true);
-          continue;
-        }
+      await importExternalFiles(files, dropPos);
+    }
+  };
 
-        const res = await uploadMediaFile(file, { boardId: initialBoard.id });
-        if (res.error) {
-          setSaveError(res.error);
-        } else if (res.asset) {
-          setAssets((prev) => [res.asset!, ...prev]);
-          if (res.asset.kind === "font") {
-            handleApplyFontAsset(res.asset);
-          } else {
-            handleInsertAsset(
-              res.asset,
-              { loop: false, autoHideOnEnd: true, muted: false },
-              dropPos
-            );
-          }
-        }
-      }
+  const isExternalFileDrag = (e: React.DragEvent) => {
+    const types = Array.from(e.dataTransfer?.types ?? []);
+    return (
+      types.includes("Files") &&
+      !types.includes("application/x-obsboard-asset") &&
+      !types.includes("application/x-oboards-move-asset") &&
+      !types.includes("application/x-oboards-layer")
+    );
+  };
+
+  const handleRootDragEnter = (e: React.DragEvent) => {
+    if (!canEdit || !isExternalFileDrag(e)) return;
+    e.preventDefault();
+    setExternalDragCount((c) => c + 1);
+  };
+
+  const handleRootDragOver = (e: React.DragEvent) => {
+    if (!canEdit || !isExternalFileDrag(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  };
+
+  const handleRootDragLeave = (e: React.DragEvent) => {
+    if (!isExternalFileDrag(e)) return;
+    setExternalDragCount((c) => Math.max(0, c - 1));
+  };
+
+  const handleRootDrop = async (e: React.DragEvent) => {
+    setExternalDragCount(0);
+    if (!canEdit || !isExternalFileDrag(e)) return;
+    e.preventDefault();
+    const files = e.dataTransfer.files;
+    if (files && files.length > 0) {
+      await importExternalFiles(files);
     }
   };
 
@@ -2722,6 +3243,11 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
     [selectedElements]
   );
 
+  const imageAssets = useMemo(
+    () => assets.filter((a) => a.kind === "image"),
+    [assets]
+  );
+
   const backdropClass =
     backdrop === "checker-dark"
       ? "obs-checkerboard"
@@ -2729,7 +3255,9 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         ? "obs-checkerboard-light"
         : backdrop === "black"
           ? "bg-black"
-          : "bg-emerald-600";
+          : backdrop === "custom-image"
+            ? "obs-checkerboard"
+            : "bg-emerald-600";
 
   const cursorStyle = spacePressed
     ? "grab"
@@ -2742,7 +3270,43 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
           : "crosshair";
 
   return (
-    <div className="h-screen w-screen bg-studio-950 text-zinc-100 flex flex-col overflow-hidden relative">
+    <div
+      className="h-screen w-screen bg-studio-950 text-zinc-100 flex flex-col overflow-hidden relative"
+      onDragEnter={handleRootDragEnter}
+      onDragOver={handleRootDragOver}
+      onDragLeave={handleRootDragLeave}
+      onDrop={handleRootDrop}
+    >
+      {/* Full-app Drag & Drop File Import Overlay */}
+      {externalDragCount > 0 && canEdit && (
+        <div className="pointer-events-none fixed inset-0 z-[180] bg-sky-950/70 backdrop-blur-sm flex items-center justify-center p-6">
+          <div className="max-w-lg w-full rounded-3xl border-2 border-dashed border-sky-400 bg-studio-900/95 p-8 text-center space-y-3 shadow-[0_0_80px_rgba(56,189,248,0.28)]">
+            <div className="w-16 h-16 rounded-2xl bg-sky-500/20 border border-sky-400/40 flex items-center justify-center mx-auto text-sky-300">
+              <UploadCloud className="w-8 h-8" />
+            </div>
+            <h2 className="text-lg font-bold text-white">
+              Suelta tus archivos para importarlos
+            </h2>
+            <p className="text-xs text-zinc-300 leading-relaxed">
+              Imágenes (PNG, JPG, WebP, GIF), Videos (MP4, WebM, MOV), Audios
+              (MP3, WAV, OGG, M4A), Documentos (PDF, TXT, MD) o Fuentes
+              (TTF, OTF, WOFF).
+            </p>
+            <p className="text-[11px] text-sky-300 font-medium">
+              Suelta sobre el área 16:9 para colocarlos al instante, o sobre la
+              Biblioteca para guardarlos.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Upload Progress Toast for Drag-and-Drop */}
+      {dropUploadLabel && (
+        <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-[170] flex items-center gap-2.5 px-4 py-2.5 rounded-2xl bg-studio-900/95 border border-sky-400/45 text-xs text-sky-100 shadow-2xl backdrop-blur">
+          <UploadCloud className="w-4 h-4 text-sky-400 animate-bounce" />
+          <span className="font-medium">{dropUploadLabel}</span>
+        </div>
+      )}
       {/* Kicked Out Overlay */}
       {kickedOut && (
         <div className="fixed inset-0 z-[200] bg-studio-950/95 backdrop-blur-md flex items-center justify-center p-6">
@@ -2968,6 +3532,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
             onMoveLayer={handleMoveLayer}
             onReorderLayer={handleReorderLayer}
             onTriggerVideo={handleTriggerVideo}
+            onControlAudio={handleControlAudio}
             onHideAllVideos={handleHideAllVideos}
             onShowAllLayers={handleShowAllLayers}
             onAssetUploaded={(asset) => {
@@ -3019,15 +3584,17 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
         <div
           ref={viewportRef}
           data-tour="stage"
-          className="flex-1 relative overflow-hidden bg-studio-950 touch-none"
+          className="flex-1 relative overflow-hidden bg-studio-950 touch-none select-none"
           style={{ cursor: cursorStyle }}
           onPointerDown={handleStagePointerDown}
           onPointerMove={handleStagePointerMove}
           onPointerUp={(e) => finishInteraction(e.pointerId)}
           onPointerCancel={(e) => finishInteraction(e.pointerId)}
-          onLostPointerCapture={() => cancelActiveInteraction()}
           onPointerLeave={() => setEraserCursorPos(null)}
-          onDragOver={(e) => e.preventDefault()}
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "copy";
+          }}
           onDrop={handleDrop}
         >
           {/* Floating Toolbar */}
@@ -3040,6 +3607,11 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
               onSelectTool={(nextTool) => {
                 setTool(nextTool);
                 if (nextTool !== "eraser") setEraserCursorPos(null);
+                if (nextTool === "text") {
+                  setSelectedIds([]);
+                  setEditingTextId(null);
+                  setShowRightPanel(true);
+                }
               }}
               canEdit={canEdit}
               canUndo={undoStack.length > 0}
@@ -3052,6 +3624,11 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
               onFitStage={() => fitStageToViewport(false)}
               backdrop={backdrop}
               onBackdropChange={setBackdrop}
+              boardBackground={boardBackground}
+              imageAssets={imageAssets}
+              uploadingBgPhoto={uploadingBgPhoto}
+              onUploadBgPhoto={handleUploadBgPhoto}
+              onUpdateBoardBackground={handleUpdateBoardBackground}
               snapEnabled={snapEnabled}
               onToggleSnap={() => setSnapEnabled((v) => !v)}
               guidesConfig={guidesConfig}
@@ -3099,6 +3676,21 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
                   "0 0 0 2px rgba(56, 189, 248, 0.72), 0 30px 90px rgba(0, 0, 0, 0.7)",
               }}
             >
+              {/* Custom Photo Background Layer */}
+              {backdrop === "custom-image" && boardBackground.imageUrl && (
+                <img
+                  src={boardBackground.imageUrl}
+                  alt="Fondo personalizado"
+                  draggable={false}
+                  className="pointer-events-none select-none absolute inset-0 w-full h-full"
+                  style={{
+                    objectFit: boardBackground.fit ?? "cover",
+                    opacity: boardBackground.opacity ?? 1,
+                    zIndex: 0,
+                  }}
+                />
+              )}
+
               {/* OBS Guide Label (Editor ONLY) */}
               <div
                 className="pointer-events-none select-none absolute left-0 flex items-center gap-2.5 px-3 py-1 rounded-t-lg bg-sky-600/95 text-white font-mono font-semibold tracking-wide whitespace-nowrap"
@@ -3111,7 +3703,9 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
               >
                 <span>ÁREA OBS · 1920×1080 (16:9)</span>
                 <span className="text-sky-100/90 font-normal">
-                  Fondo 100% transparente en directo
+                  {boardBackground.imageUrl && boardBackground.showInObs
+                    ? "Fondo foto personalizado activo en OBS"
+                    : "Fondo 100% transparente en directo"}
                 </span>
               </div>
 
@@ -3167,59 +3761,51 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
               {elements.map((el) => {
                 const markedErase = eraserPreviewIds.has(el.id);
                 return (
-                  <div
+                  <StageElement
                     key={el.id}
-                    style={{
-                      opacity: markedErase ? 0.3 : 1,
-                      filter: markedErase ? "brightness(1.2)" : undefined,
-                      display: "contents",
-                    }}
-                  >
-                    <StageElement
-                      element={
-                        markedErase ? { ...el, opacity: (el.opacity ?? 1) * 0.3 } : el
-                      }
-                      mode="editor"
-                      isEditingText={editingTextId === el.id}
-                      onTextChange={(nextText) =>
-                        handlePatchElement(el.id, { text: nextText }, false)
-                      }
-                      onTextResize={(nextHeight) =>
-                        handlePatchElement(el.id, { height: nextHeight }, false)
-                      }
-                      onTextBlur={() => {
-                        const current = elementsRef.current.find(
-                          (i) => i.id === el.id
-                        );
-                        if (current) {
-                          if (!(current.text ?? "").trim()) {
-                            handleDeleteElements([el.id]);
-                          } else {
-                            persistPatch(el.id, {
-                              text: current.text,
-                              height: current.height,
-                            });
-                          }
-                        }
-                        setEditingTextId(null);
-                      }}
-                      onVideoAutoHide={(elId) => {
-                        handlePatchElement(elId, {
-                          visible: false,
-                          playing: false,
+                    element={
+                      markedErase ? { ...el, opacity: (el.opacity ?? 1) * 0.3 } : el
+                    }
+                    mode="editor"
+                    zoom={camera.zoom}
+                    canEdit={canEdit}
+                    isEditingText={editingTextId === el.id}
+                    onTextChange={(nextText) =>
+                      handlePatchElement(el.id, { text: nextText }, false)
+                    }
+                    onTextResize={(nextHeight) =>
+                      handlePatchElement(el.id, { height: nextHeight }, false)
+                    }
+                    onTextBlur={() => {
+                      const current = elementsRef.current.find(
+                        (i) => i.id === el.id
+                      );
+                      if (current) {
+                        persistPatch(el.id, {
+                          text: current.text ?? "",
+                          height: current.height,
                         });
-                      }}
-                      onPointerDown={(e) => handleElementPointerDown(e, el)}
-                      onDoubleClick={(e) => {
-                        if (!canEdit || el.locked) return;
-                        if (el.type === "text") {
-                          e.stopPropagation();
-                          setSelectedIds([el.id]);
-                          setEditingTextId(el.id);
-                        }
-                      }}
-                    />
-                  </div>
+                      }
+                      setEditingTextId(null);
+                    }}
+                    onVideoAutoHide={(elId) => {
+                      handlePatchElement(elId, {
+                        visible: false,
+                        playing: false,
+                      });
+                    }}
+                    onAudioControl={handleControlAudio}
+                    onAudioWaveformDecoded={handleAudioWaveformDecoded}
+                    onPointerDown={(e) => handleElementPointerDown(e, el)}
+                    onDoubleClick={(e) => {
+                      if (!canEdit || el.locked) return;
+                      if (el.type === "text") {
+                        e.stopPropagation();
+                        setSelectedIds([el.id]);
+                        setEditingTextId(el.id);
+                      }
+                    }}
+                  />
                 );
               })}
 
@@ -3295,11 +3881,10 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
                 />
               )}
 
-              {/* Single Selection & Transform Controls (EDITOR ONLY — works even when ghost-hidden!) */}
+              {/* Single Selection & Transform Controls (EDITOR ONLY — works even when ghost-hidden or editing text!) */}
               {singleSelected &&
                 canEdit &&
-                !singleSelected.locked &&
-                editingTextId !== singleSelected.id && (
+                !singleSelected.locked && (
                   <div
                     className="pointer-events-none"
                     style={{
@@ -3316,9 +3901,52 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
                     }}
                   >
                     <div
-                      className="absolute inset-0 border-2 border-sky-400"
+                      className="absolute inset-0 border-2 border-sky-400 pointer-events-none"
                       style={{ borderWidth: Math.max(1.5, 2 / camera.zoom) }}
                     />
+
+                    {/* Draggable border strips so even hollow shapes / strokes / active text can be dragged effortlessly */}
+                    {tool === "select" && !spacePressed && (
+                      <>
+                        {(
+                          [
+                            { top: -6 / camera.zoom, left: 0, right: 0, height: 12 / camera.zoom },
+                            { bottom: -6 / camera.zoom, left: 0, right: 0, height: 12 / camera.zoom },
+                            { left: -6 / camera.zoom, top: 0, bottom: 0, width: 12 / camera.zoom },
+                            { right: -6 / camera.zoom, top: 0, bottom: 0, width: 12 / camera.zoom },
+                          ] as React.CSSProperties[]
+                        ).map((edgeStyle, edgeIdx) => (
+                          <div
+                            key={edgeIdx}
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              e.preventDefault();
+                              setEditingTextId(null);
+                              const pt = screenToStage(e.clientX, e.clientY);
+                              interactionRef.current = {
+                                kind: "move",
+                                pointerId: e.pointerId,
+                                startClientX: e.clientX,
+                                startClientY: e.clientY,
+                                startStageX: pt.x,
+                                startStageY: pt.y,
+                                items: [
+                                  {
+                                    id: singleSelected.id,
+                                    origX: singleSelected.x,
+                                    origY: singleSelected.y,
+                                  },
+                                ],
+                                moved: false,
+                              };
+                              capturePointerSafe(e.pointerId);
+                            }}
+                            className="pointer-events-auto absolute cursor-move"
+                            style={edgeStyle}
+                          />
+                        ))}
+                      </>
+                    )}
 
                     {/* Rotation handle */}
                     <div
@@ -3373,6 +4001,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
                     if (tool !== "select" || spacePressed || e.button !== 0 || !canEdit)
                       return;
                     e.stopPropagation();
+                    e.preventDefault();
                     const pt = screenToStage(e.clientX, e.clientY);
                     const itemsToMove = elementsRef.current
                       .filter(
@@ -3389,12 +4018,14 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
                     interactionRef.current = {
                       kind: "move",
                       pointerId: e.pointerId,
+                      startClientX: e.clientX,
+                      startClientY: e.clientY,
                       startStageX: pt.x,
                       startStageY: pt.y,
                       items: itemsToMove,
                       moved: false,
                     };
-                    viewportRef.current?.setPointerCapture(e.pointerId);
+                    capturePointerSafe(e.pointerId);
                   }}
                   className="pointer-events-auto cursor-move absolute border-2 border-dashed border-sky-400 bg-sky-500/[0.03]"
                   style={{
@@ -3458,7 +4089,7 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
               <kbd className="text-zinc-200 font-mono">G</kbd> guías
             </span>
             <span>·</span>
-            <span>Suelta PDF, MP4, WebM, PNG o fuentes aquí</span>
+            <span>Suelta MP3, MP4, WebM, PNG, PDF o fuentes aquí</span>
           </div>
         </div>
 
@@ -3477,6 +4108,8 @@ export const BoardEditor: React.FC<BoardEditorProps> = ({
             onDeleteElements={handleDeleteElements}
             onDuplicateElement={handleDuplicateElement}
             onTriggerVideo={handleTriggerVideo}
+            onControlAudio={handleControlAudio}
+            onInsertTextFromPanel={handleInsertTextFromPanel}
             onFontUploaded={(asset) => {
               setAssets((prev) => [
                 asset,

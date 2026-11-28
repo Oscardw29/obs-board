@@ -23,10 +23,13 @@ import {
   Pause,
   Play,
   Plus,
+  Radio,
   Repeat,
+  RotateCcw,
   Sliders,
   Sparkles,
   Trash2,
+  Type as TypeIcon,
   Underline,
   Upload,
   Volume2,
@@ -63,6 +66,10 @@ import {
   type TextFontFamily,
   type ToolType,
 } from "@/types/board";
+import {
+  formatAudioTime,
+  type AudioControlUpdate,
+} from "./AudioElementNode";
 import { CustomColorPicker } from "./ui/CustomColorPicker";
 import { CustomNumberInput } from "./ui/CustomNumberInput";
 import { CustomSelect, type CustomSelectOption } from "./ui/CustomSelect";
@@ -78,6 +85,7 @@ export interface DrawDefaults {
   brushSmoothing: number;
   brushTaper: number;
   opacity: number;
+  defaultText: string;
   fontFamily: TextFontFamily;
   customFontName?: string;
   customFontUrl?: string;
@@ -106,6 +114,8 @@ interface StyleInspectorPanelProps {
     id: string,
     opts?: { playing?: boolean; visible?: boolean; restart?: boolean }
   ) => void;
+  onControlAudio: (id: string, update: AudioControlUpdate) => void;
+  onInsertTextFromPanel: (text: string) => void;
   onFontUploaded: (asset: MediaAsset) => void;
 }
 
@@ -135,6 +145,8 @@ export const StyleInspectorPanel: React.FC<StyleInspectorPanelProps> = ({
   onDeleteElements,
   onDuplicateElement,
   onTriggerVideo,
+  onControlAudio,
+  onInsertTextFromPanel,
   onFontUploaded,
 }) => {
   // Estilo MUST go first and be selected by default!
@@ -461,6 +473,57 @@ export const StyleInspectorPanel: React.FC<StyleInspectorPanelProps> = ({
       {/* STYLE TAB */}
       {tab === "style" && (
         <div className="flex-1 overflow-y-auto p-3.5 space-y-4 text-xs animate-panel-enter">
+          {/* Text Tool Panel (when Text tool is active & nothing selected) */}
+          {tool === "text" && !selected && !isMulti && canEdit && (
+            <div className="rounded-xl bg-sky-500/10 border border-sky-400/35 p-3 space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-sky-200 uppercase tracking-wider">
+                  <TypeIcon className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Herramienta de Texto</span>
+                </span>
+              </div>
+              <textarea
+                rows={3}
+                value={drawDefaults.defaultText}
+                onChange={(e) =>
+                  onDrawDefaultsChange({
+                    ...drawDefaults,
+                    defaultText: e.target.value,
+                  })
+                }
+                placeholder="Escribe aquí el texto que quieres colocar en el área…"
+                className="w-full rounded-xl bg-studio-950 border border-white/[0.12] focus:border-sky-400 px-2.5 py-2 text-xs text-white placeholder:text-zinc-500 outline-none resize-y select-text"
+              />
+              <button
+                type="button"
+                onClick={() =>
+                  onInsertTextFromPanel(
+                    drawDefaults.defaultText.trim() || "Nuevo texto"
+                  )
+                }
+                className="w-full py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-colors shadow-md shadow-sky-600/20"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Añadir texto al área</span>
+              </button>
+              <p className="text-[10px] text-zinc-400 leading-relaxed">
+                También puedes hacer clic en cualquier punto del área 16:9 para
+                colocar este texto, o hacer clic sobre un texto ya colocado para
+                editarlo directamente.
+              </p>
+              <CustomSlider
+                label="Tamaño de texto"
+                min={14}
+                max={180}
+                unit="px"
+                value={drawDefaults.fontSize}
+                onChange={(v) =>
+                  onDrawDefaultsChange({ ...drawDefaults, fontSize: v })
+                }
+              />
+            </div>
+          )}
+
           {/* Eraser Tool Options */}
           {tool === "eraser" && !selected && !isMulti && (
             <div className="rounded-xl bg-rose-500/10 border border-rose-500/30 p-3 space-y-3">
@@ -861,6 +924,151 @@ export const StyleInspectorPanel: React.FC<StyleInspectorPanelProps> = ({
                   </div>
                 )}
 
+              {/* Audio Controls */}
+              {selected.type === "audio" && canEdit && (
+                <div className="rounded-xl bg-orange-500/10 border border-orange-400/35 p-3 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[11px] font-semibold text-orange-200 uppercase tracking-wider inline-flex items-center gap-1.5">
+                      <Radio className="w-3.5 h-3.5 text-orange-400" />
+                      <span>Control de Audio</span>
+                    </p>
+                    <span className="text-[10px] font-mono tabular-nums text-orange-300">
+                      {formatAudioTime(selected.currentTimeSec ?? 0)} /{" "}
+                      {formatAudioTime(selected.durationSec ?? 0)}
+                    </span>
+                  </div>
+
+                  <p className="text-[10px] text-orange-200/80 bg-black/35 border border-orange-400/20 rounded-lg px-2 py-1.5 leading-relaxed">
+                    Solo visible en OBoardS. En el stream (OBS) es invisible y
+                    solo se escucha el sonido.
+                  </p>
+
+                  <div className="flex gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onControlAudio(selected.id, {
+                          playing: !selected.playing,
+                          currentTimeSec: selected.currentTimeSec ?? 0,
+                          commit: true,
+                        })
+                      }
+                      className="flex-1 py-2 rounded-lg bg-orange-500 hover:bg-orange-400 text-studio-950 font-semibold inline-flex items-center justify-center gap-1.5 transition-colors"
+                    >
+                      {selected.playing ? (
+                        <>
+                          <Pause className="w-3.5 h-3.5 fill-current" />
+                          <span>Pausar</span>
+                        </>
+                      ) : (
+                        <>
+                          <Play className="w-3.5 h-3.5 fill-current" />
+                          <span>Reproducir</span>
+                        </>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onControlAudio(selected.id, {
+                          playing: true,
+                          currentTimeSec: 0,
+                          commit: true,
+                        })
+                      }
+                      title="Reiniciar desde 0:00"
+                      aria-label="Reiniciar audio"
+                      className="px-3 py-2 rounded-lg bg-studio-900 hover:bg-studio-800 border border-white/[0.08] text-zinc-200 inline-flex items-center gap-1"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+
+                  {(selected.durationSec ?? 0) > 0 && (
+                    <CustomSlider
+                      label="Posición (segundos)"
+                      min={0}
+                      max={Math.max(1, Math.round(selected.durationSec ?? 1))}
+                      step={1}
+                      unit="s"
+                      value={Math.round(selected.currentTimeSec ?? 0)}
+                      onChange={(val) =>
+                        onControlAudio(selected.id, {
+                          playing: Boolean(selected.playing),
+                          currentTimeSec: val,
+                          commit: false,
+                        })
+                      }
+                      onCommit={(val) =>
+                        onControlAudio(selected.id, {
+                          playing: Boolean(selected.playing),
+                          currentTimeSec: val,
+                          commit: true,
+                        })
+                      }
+                    />
+                  )}
+
+                  <CustomToggle
+                    label="Reproducir en bucle (Loop)"
+                    checked={Boolean(selected.loop)}
+                    onChange={(checked) =>
+                      onControlAudio(selected.id, {
+                        playing: Boolean(selected.playing),
+                        currentTimeSec: selected.currentTimeSec ?? 0,
+                        loop: checked,
+                        commit: true,
+                      })
+                    }
+                  />
+
+                  <div className="space-y-1.5">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onControlAudio(selected.id, {
+                          playing: Boolean(selected.playing),
+                          currentTimeSec: selected.currentTimeSec ?? 0,
+                          muted: !selected.muted,
+                          commit: true,
+                        })
+                      }
+                      className="inline-flex items-center gap-1.5 text-[11px] text-zinc-200 hover:text-white"
+                    >
+                      {selected.muted ? (
+                        <VolumeX className="w-3.5 h-3.5 text-rose-400" />
+                      ) : (
+                        <Volume2 className="w-3.5 h-3.5 text-emerald-400" />
+                      )}
+                      <span>{selected.muted ? "Silenciado" : "Volumen"}</span>
+                    </button>
+                    <CustomSlider
+                      min={0}
+                      max={100}
+                      unit="%"
+                      value={Math.round((selected.volume ?? 0.85) * 100)}
+                      onChange={(val) =>
+                        onControlAudio(selected.id, {
+                          playing: Boolean(selected.playing),
+                          currentTimeSec: selected.currentTimeSec ?? 0,
+                          volume: val / 100,
+                          muted: val === 0,
+                          commit: true,
+                        })
+                      }
+                    />
+                  </div>
+
+                  <CustomColorPicker
+                    label="Color del visualizador"
+                    value={selected.waveformColor ?? "#fb923c"}
+                    onChange={(c) =>
+                      onPatchElement(selected.id, { waveformColor: c })
+                    }
+                  />
+                </div>
+              )}
+
               {/* Video Controls */}
               {selected.type === "video" && canEdit && (
                 <div className="rounded-xl bg-sky-500/10 border border-sky-500/30 p-3 space-y-3">
@@ -1073,6 +1281,29 @@ export const StyleInspectorPanel: React.FC<StyleInspectorPanelProps> = ({
               {/* Text Controls */}
               {selected.type === "text" && canEdit && (
                 <div className="space-y-3 border-t border-white/[0.07] pt-3">
+                  {/* Direct Text Content Field in Right Menu */}
+                  <div className="space-y-1.5">
+                    <label
+                      htmlFor="inspector-text-content"
+                      className="text-[11px] font-semibold text-sky-200 flex items-center justify-between"
+                    >
+                      <span>Contenido del texto</span>
+                      <span className="text-[9px] font-normal text-zinc-500">
+                        También editable con clic en el área
+                      </span>
+                    </label>
+                    <textarea
+                      id="inspector-text-content"
+                      rows={3}
+                      value={selected.text ?? ""}
+                      onChange={(e) =>
+                        onPatchElement(selected.id, { text: e.target.value })
+                      }
+                      placeholder="Escribe aquí lo que quieres que aparezca…"
+                      className="w-full rounded-xl bg-studio-950 border border-sky-400/40 focus:border-sky-400 px-2.5 py-2 text-xs text-white placeholder:text-zinc-500 outline-none resize-y select-text"
+                    />
+                  </div>
+
                   <div className="space-y-1.5">
                     <div className="flex items-center justify-between">
                       <span className="text-[11px] font-medium text-zinc-300">

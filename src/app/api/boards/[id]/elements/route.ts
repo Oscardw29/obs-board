@@ -43,6 +43,18 @@ type ElementMutationBody =
       autoHideOnEnd?: boolean;
     }
   | {
+      action: "controlAudio";
+      senderId: string;
+      elementId: string;
+      playing: boolean;
+      currentTimeSec: number;
+      triggeredAt: number;
+      seekId: string;
+      loop?: boolean;
+      muted?: boolean;
+      volume?: number;
+    }
+  | {
       action: "authorVisibility";
       senderId: string;
       userId?: string;
@@ -193,6 +205,40 @@ export async function POST(
         muted: body.muted,
         volume: body.volume,
         autoHideOnEnd: body.autoHideOnEnd,
+      },
+      senderId
+    );
+    return NextResponse.json({ ok: true, element: res.element });
+  }
+
+  if (body.action === "controlAudio") {
+    const patch: Partial<BoardElement> = {
+      playing: body.playing,
+      currentTimeSec: body.currentTimeSec,
+      triggeredAt: body.triggeredAt,
+      seekId: body.seekId,
+    };
+    if (body.loop !== undefined) patch.loop = body.loop;
+    if (body.muted !== undefined) patch.muted = body.muted;
+    if (body.volume !== undefined) patch.volume = body.volume;
+
+    const res = await patchElement(boardId, user, body.elementId, patch);
+    if (!res.ok) {
+      return NextResponse.json({ error: res.error }, { status: 403 });
+    }
+    realtimeHub.broadcast(
+      boardId,
+      {
+        type: "audio:control",
+        senderId,
+        elementId: body.elementId,
+        playing: body.playing,
+        currentTimeSec: body.currentTimeSec,
+        triggeredAt: body.triggeredAt,
+        seekId: body.seekId,
+        loop: body.loop,
+        muted: body.muted,
+        volume: body.volume,
       },
       senderId
     );

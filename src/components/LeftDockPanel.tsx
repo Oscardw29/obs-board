@@ -3,6 +3,7 @@
 import React, { useState } from "react";
 import { FolderKanban, Layers } from "lucide-react";
 import type { BoardElement, MediaAsset, MediaFolder } from "@/types/board";
+import type { AudioControlUpdate } from "./AudioElementNode";
 import { LayersPanel } from "./LayersPanel";
 import { MediaLibraryPanel } from "./MediaLibraryPanel";
 
@@ -23,6 +24,7 @@ interface LeftDockPanelProps {
     id: string,
     opts?: { playing?: boolean; visible?: boolean; restart?: boolean }
   ) => void;
+  onControlAudio: (id: string, update: AudioControlUpdate) => void;
   onHideAllVideos: () => void;
   onShowAllLayers: () => void;
   onAssetUploaded: (asset: MediaAsset) => void;
@@ -104,6 +106,7 @@ export const LeftDockPanel: React.FC<LeftDockPanelProps> = (props) => {
           onMoveLayer={props.onMoveLayer}
           onReorderLayer={props.onReorderLayer}
           onTriggerVideo={props.onTriggerVideo}
+          onControlAudio={props.onControlAudio}
           onHideAllVideos={props.onHideAllVideos}
           onShowAllLayers={props.onShowAllLayers}
         />
@@ -123,13 +126,22 @@ export const LeftDockPanel: React.FC<LeftDockPanelProps> = (props) => {
           onInsertAsset={props.onInsertAsset}
           onApplyFontAsset={props.onApplyFontAsset}
           onOpenDocumentModal={props.onOpenDocumentModal}
-          onQuickTriggerExisting={(elId) =>
-            props.onTriggerVideo(elId, {
-              restart: true,
-              playing: true,
-              visible: true,
-            })
-          }
+          onQuickTriggerExisting={(elId) => {
+            const target = props.elements.find((e) => e.id === elId);
+            if (target?.type === "audio") {
+              props.onControlAudio(elId, {
+                playing: true,
+                currentTimeSec: 0,
+                commit: true,
+              });
+            } else {
+              props.onTriggerVideo(elId, {
+                restart: true,
+                playing: true,
+                visible: true,
+              });
+            }
+          }}
         />
       )}
     </aside>

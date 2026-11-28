@@ -288,6 +288,8 @@ export function getElementDefaultName(type: BoardElement["type"]): string {
       return "Imagen";
     case "video":
       return "Video / Clip";
+    case "audio":
+      return "Audio";
     case "document":
       return "Documento";
   }

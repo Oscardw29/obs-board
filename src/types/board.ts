@@ -42,6 +42,7 @@ export type ElementType =
   | "text"
   | "image"
   | "video"
+  | "audio"
   | "document";
 
 export type ToolType =
@@ -211,7 +212,7 @@ export interface BoardElement {
   documentPages?: DocumentPage[];
   currentPage?: number;
 
-  // Video playback & quick-trigger properties
+  // Video & Audio playback & quick-trigger properties
   playing?: boolean;
   loop?: boolean;
   muted?: boolean;
@@ -219,6 +220,13 @@ export interface BoardElement {
   autoHideOnEnd?: boolean;
   triggerId?: string; // bumped every time clip is re-triggered from 0:00
   triggeredAt?: number; // epoch ms when trigger fired
+
+  // Audio-specific properties (editor-only visualizer, audio-only in OBS stream)
+  durationSec?: number;
+  currentTimeSec?: number;
+  seekId?: string;
+  waveformPeaks?: number[];
+  waveformColor?: string;
 
   // Animation properties
   animation?: ElementAnimationConfig;
@@ -249,7 +257,7 @@ export interface MediaAsset {
   boardId?: string | null;
   folderId?: string | null;
   name: string;
-  kind: "video" | "image" | "document" | "font";
+  kind: "video" | "image" | "audio" | "document" | "font";
   mimeType: string;
   url: string;
   fileName: string;
@@ -263,8 +271,16 @@ export interface MediaAsset {
   metadata?: {
     documentPages?: DocumentPage[];
     fontFamily?: string;
+    waveformPeaks?: number[];
   };
   createdAt: string;
+}
+
+export interface BoardBackgroundConfig {
+  imageUrl?: string | null;
+  fit?: "cover" | "contain";
+  opacity?: number; // 0.1..1
+  showInObs?: boolean;
 }
 
 export interface BoardSummary {
@@ -276,6 +292,7 @@ export interface BoardSummary {
   obsToken: string;
   stageWidth: number;
   stageHeight: number;
+  background?: BoardBackgroundConfig;
   myRole: BoardRole;
   myPaused?: boolean;
   memberCount: number;
@@ -362,9 +379,22 @@ export type RealtimeEvent =
       autoHideOnEnd?: boolean;
     }
   | {
+      type: "audio:control";
+      senderId: string;
+      elementId: string;
+      playing: boolean;
+      currentTimeSec: number;
+      triggeredAt: number;
+      seekId: string;
+      loop?: boolean;
+      muted?: boolean;
+      volume?: number;
+    }
+  | {
       type: "board:meta";
       senderId: string;
-      title: string;
+      title?: string;
+      background?: BoardBackgroundConfig;
     }
   | {
       type: "cursor:move";

@@ -6,6 +6,7 @@ import { nanoid } from "nanoid";
 import {
   STAGE_HEIGHT,
   STAGE_WIDTH,
+  type BoardBackgroundConfig,
   type BoardDetail,
   type BoardElement,
   type BoardMember,
@@ -59,7 +60,10 @@ function formatSupabaseError(err: { code?: string; message: string }): string {
   return err.message;
 }
 
-export function computeElementsHash(elements: BoardElement[]): string {
+export function computeElementsHash(
+  elements: BoardElement[],
+  background?: BoardBackgroundConfig
+): string {
   const sorted = [...elements].sort((a, b) => a.id.localeCompare(b.id));
   const compact = sorted.map((e) => [
     e.id,
@@ -76,13 +80,23 @@ export function computeElementsHash(elements: BoardElement[]): string {
     e.text ?? "",
     e.currentPage ?? 0,
     e.triggerId ?? "",
+    e.seekId ?? "",
+    e.currentTimeSec ?? 0,
     e.playing ? 1 : 0,
     e.strokeColor ?? "",
     e.fillColor ?? "",
   ]);
+  const bgPart = background
+    ? [
+        background.imageUrl ?? "",
+        background.fit ?? "cover",
+        background.opacity ?? 1,
+        background.showInObs ? 1 : 0,
+      ]
+    : null;
   return crypto
     .createHash("sha1")
-    .update(JSON.stringify(compact))
+    .update(JSON.stringify([compact, bgPart]))
     .digest("hex")
     .slice(0, 16);
 }
@@ -437,6 +451,17 @@ export async function getBoardForUser(
       obsToken: b.obs_token,
       stageWidth: b.stage_width ?? STAGE_WIDTH,
       stageHeight: b.stage_height ?? STAGE_HEIGHT,
+      background: b.background_image_url
+        ? {
+            imageUrl: b.background_image_url as string,
+            fit: (b.background_image_fit as "cover" | "contain") || "cover",
+            opacity:
+              typeof b.background_opacity === "number"
+                ? b.background_opacity
+                : 1,
+            showInObs: Boolean(b.background_show_in_obs),
+          }
+        : undefined,
       myRole: access.role,
       myPaused: access.paused,
       memberCount: members.length,
@@ -492,6 +517,7 @@ export async function getBoardForUser(
     obsToken: board.obsToken,
     stageWidth: board.stageWidth,
     stageHeight: board.stageHeight,
+    background: board.background,
     myRole: isOwner ? "owner" : member!.role,
     myPaused: isOwner ? false : Boolean(member?.paused),
     memberCount: members.length,
@@ -512,6 +538,7 @@ export async function getBoardForObs(
   title: string;
   stageWidth: number;
   stageHeight: number;
+  background?: BoardBackgroundConfig;
   elements: BoardElement[];
 } | null> {
   if (!token) return null;
@@ -522,7 +549,7 @@ export async function getBoardForObs(
 
     const { data: b } = await client
       .from("boards")
-      .select("id, title, obs_token, stage_width, stage_height")
+      .select("*")
       .eq("id", boardId)
       .maybeSingle();
 
@@ -539,6 +566,17 @@ export async function getBoardForObs(
       title: b.title,
       stageWidth: b.stage_width ?? STAGE_WIDTH,
       stageHeight: b.stage_height ?? STAGE_HEIGHT,
+      background: b.background_image_url
+        ? {
+            imageUrl: b.background_image_url as string,
+            fit: (b.background_image_fit as "cover" | "contain") || "cover",
+            opacity:
+              typeof b.background_opacity === "number"
+                ? b.background_opacity
+                : 1,
+            showInObs: Boolean(b.background_show_in_obs),
+          }
+        : undefined,
       elements: (elRows ?? []).map((r) => r.data as BoardElement),
     };
   }
@@ -556,8 +594,64 @@ export async function getBoardForObs(
     title: board.title,
     stageWidth: board.stageWidth,
     stageHeight: board.stageHeight,
+    background: board.background,
     elements,
   };
+}
+
+export async function updateBoardBackground(
+  boardId: string,
+  user: User,
+  background: BoardBackgroundConfig
+): Promise<{ ok: boolean; background?: BoardBackgroundConfig; error?: string }> {
+  const access = await getUserBoardAccess(boardId, user);
+  if (!canEditAccess(access)) {
+    return { ok: false, error: "Sin permisos para cambiar el fondo de este tablero." };
+  }
+  const cleanBg: BoardBackgroundConfig = background.imageUrl
+    ? {
+        imageUrl: background.imageUrl,
+        fit: background.fit === "contain" ? "contain" : "cover",
+        opacity:
+          typeof background.opacity === "number"
+            ? Math.min(1, Math.max(0.1, background.opacity))
+            : 1,
+        showInObs: Boolean(background.showInObs),
+      }
+    : { imageUrl: null, fit: "cover", opacity: 1, showInObs: false };
+
+  const now = new Date().toISOString();
+
+  if (isSupabaseConfigured()) {
+    const supabase = await getCloudDbClient();
+    if (!supabase) return { ok: false, error: "Supabase no disponible." };
+    const { error } = await supabase
+      .from("boards")
+      .update({
+        background_image_url: cleanBg.imageUrl ?? null,
+        background_image_fit: cleanBg.fit ?? "cover",
+        background_opacity: cleanBg.opacity ?? 1,
+        background_show_in_obs: Boolean(cleanBg.showInObs),
+        updated_at: now,
+      })
+      .eq("id", boardId);
+    if (error) {
+      // If user hasn't migrated schema.sql yet, don't crash editor; still allow realtime/local preview
+      if (error.code === "42703" || error.code === "PGRST204") {
+        return { ok: true, background: cleanBg };
+      }
+      return { ok: false, error: formatSupabaseError(error) };
+    }
+    return { ok: true, background: cleanBg };
+  }
+
+  return mutateLocalDb((db) => {
+    const board = db.boards.find((b) => b.id === boardId);
+    if (!board) return { ok: false, error: "Tablero no encontrado." };
+    board.background = cleanBg.imageUrl ? cleanBg : undefined;
+    board.updatedAt = now;
+    return { ok: true, background: cleanBg };
+  });
 }
 
 export async function updateBoardTitle(
@@ -1870,9 +1964,11 @@ export async function saveMediaAsset(
     ? rawExt
     : input.kind === "video"
       ? ".mp4"
-      : input.kind === "font"
-        ? ".ttf"
-        : ".png";
+      : input.kind === "audio"
+        ? ".mp3"
+        : input.kind === "font"
+          ? ".ttf"
+          : ".png";
   const storedFileName = `${id}${safeExt}`;
   const now = new Date().toISOString();
 
